@@ -1,23 +1,29 @@
 #![feature(cfg_target_has_atomic)]
 #![cfg(all(target_pointer_width = "64", target_has_atomic = "64"))]
 #![feature(allocator_api)]
+#![feature(box_into_raw_non_null)]
 
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Release;
+use std::sync::atomic::Ordering;
 
 use std::marker::PhantomData;
 
 use std::sync::Arc;
 use std::option::Option;
 
-use std::ops::Deref;
 use std::mem;
 use std::num::NonZeroUsize;
 
 use std::alloc::Alloc;
+use std::ptr::NonNull;
+
+use std::ops::Deref;
+use std::ops::DerefMut;
+use std::clone::Clone;
 
 // Useful constants to help us pack and unpack the pointer and count to/from
 // the atomic integer
@@ -27,6 +33,397 @@ const MASK  : usize = (1 << SHIFT) - 1;
 const LIMIT : usize = (!MASK) >> SHIFT;
 const DELTA : usize = LIMIT + 1;
 const N : usize = 1 << 16;
+
+struct CountedPtr<T> {
+    ptr: usize,
+    phantom: PhantomData<*mut T>,
+}
+
+impl<T> CountedPtr<T> {
+
+    fn new(count: usize, pointer: *mut T) -> Self {
+        Self {
+            ptr: ((count - 1) << SHIFT) | (pointer as usize),
+            phantom: PhantomData,
+        }
+    }
+
+    fn get(&self) -> (usize, *mut T) {
+        ((self.ptr >> SHIFT) + 1, (self.ptr & MASK) as *mut T)
+    }
+
+    fn set_count(&mut self, count: usize) {
+        let (_, p) = self.get();
+        *self = Self::new(count, p);
+    }
+
+}
+
+impl<T> Clone for CountedPtr<T> {
+    fn clone(&self) -> Self {
+        Self {
+            ptr: self.ptr,
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<T> Copy for CountedPtr<T> {}
+
+impl<T> Deref for CountedPtr<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        let (_, p) = self.get();
+        unsafe { &*p }
+    }
+}
+
+impl<T> DerefMut for CountedPtr<T> {
+    fn deref_mut(&mut self) ->&mut T {
+        let (_, p) = self.get();
+        unsafe { &mut *p }
+    }
+}
+
+
+
+
+
+
+struct CountedNonNullPtr<T> {
+    ptr: NonZeroUsize,
+    phantom: PhantomData<NonNull<T>>,
+}
+
+impl<T> CountedNonNullPtr<T> {
+
+    fn new(count: usize, pointer: NonNull<T>) -> Self {
+        let x = ((count - 1) << SHIFT) | (pointer.as_ptr() as usize);
+        Self {
+            ptr: unsafe { NonZeroUsize::new_unchecked(x) },
+            phantom: PhantomData,
+        }
+    }
+
+    fn get(&self) -> (usize, NonNull<T>) {
+        let n = self.ptr.get();
+        let p = (n & MASK) as *mut T;
+        ((n >> SHIFT) + 1, unsafe { NonNull::new_unchecked(p) })
+    }
+
+    fn set_count(&mut self, count: usize) {
+        let (_, p) = self.get();
+        *self = Self::new(count, p);
+    }
+
+}
+
+impl<T> Clone for CountedNonNullPtr<T> {
+    fn clone(&self) -> Self {
+        Self {
+            ptr: self.ptr,
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<T> Copy for CountedNonNullPtr<T> {}
+
+impl<T> Deref for CountedNonNullPtr<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        let (_, p) = self.get();
+        unsafe { &*p.as_ptr() }
+    }
+}
+
+impl<T> DerefMut for CountedNonNullPtr<T> {
+    fn deref_mut(&mut self) ->&mut T {
+        let (_, p) = self.get();
+        unsafe { &mut *p.as_ptr() }
+    }
+}
+
+struct AtomicOptionCountedNonNullPtr<T> {
+    ptr: AtomicUsize,
+    phantom: PhantomData<Option<CountedNonNullPtr<T>>>,
+}
+
+impl<T> AtomicOptionCountedNonNullPtr<T> {
+
+    fn to_usize(x: Option<CountedNonNullPtr<T>>) -> usize {
+        match x {
+            None => 0,
+            Some(y) => y.ptr.get(),
+        }
+    }
+
+    fn from_usize(x: usize) -> Option<CountedNonNullPtr<T>> {
+        match x {
+            0 => None,
+            y => Some(CountedNonNullPtr {
+                ptr: unsafe { NonZeroUsize::new_unchecked(y) },
+                phantom: PhantomData,
+                }
+            ),
+        }
+    }
+
+    fn new(x: Option<CountedNonNullPtr<T>>) -> Self {
+        Self {
+            ptr: AtomicUsize::new(Self::to_usize(x)),
+            phantom: PhantomData,
+        }
+    }
+
+    fn load(&self, order: Ordering) -> Option<CountedNonNullPtr<T>> {
+        Self::from_usize(self.ptr.load(order))
+    }
+
+    fn store(&self, val: Option<CountedNonNullPtr<T>>, order: Ordering) {
+        self.ptr.store(Self::to_usize(val), order)
+    }
+
+    fn swap(&self, val: Option<CountedNonNullPtr<T>>, order: Ordering) -> Option<CountedNonNullPtr<T>> {
+        Self::from_usize(self.ptr.swap(Self::to_usize(val), order))
+    }
+
+    fn compare_and_swap(
+        &self,
+        current: Option<CountedNonNullPtr<T>>,
+        new: Option<CountedNonNullPtr<T>>,
+        order: Ordering
+    ) -> Option<CountedNonNullPtr<T>> {
+        Self::from_usize(
+            self.ptr.compare_and_swap(
+                Self::to_usize(current),
+                Self::to_usize(new),
+                order
+            )
+        )
+    }
+
+    fn compare_exchange(
+        &self,
+        current: Option<CountedNonNullPtr<T>>,
+        new: Option<CountedNonNullPtr<T>>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<Option<CountedNonNullPtr<T>>, Option<CountedNonNullPtr<T>>> {
+        match self.ptr.compare_exchange(
+            Self::to_usize(current),
+            Self::to_usize(new),
+            success,
+            failure,
+        ) {
+            Ok(x) => Ok(Self::from_usize(x)),
+            Err(x) => Err(Self::from_usize(x)),
+        }
+    }
+
+    fn compare_exchange_weak(
+        &self,
+        current: Option<CountedNonNullPtr<T>>,
+        new: Option<CountedNonNullPtr<T>>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<Option<CountedNonNullPtr<T>>, Option<CountedNonNullPtr<T>>> {
+        match self.ptr.compare_exchange_weak(
+            Self::to_usize(current),
+            Self::to_usize(new),
+            success,
+            failure
+        ) {
+            Ok(x) => Ok(Self::from_usize(x)),
+            Err(x) => Err(Self::from_usize(x)),
+        }
+    }
+
+}
+
+struct AtomicCountedNonNullPtr<T> {
+    ptr: AtomicUsize,
+    phantom: PhantomData<CountedNonNullPtr<T>>
+}
+
+impl<T> AtomicCountedNonNullPtr<T> {
+
+    fn to_usize(x: CountedNonNullPtr<T>) -> usize {
+        x.ptr.get()
+    }
+
+    fn from_usize(x: usize) -> CountedNonNullPtr<T> {
+        CountedNonNullPtr {
+            ptr: unsafe { NonZeroUsize::new_unchecked(x) },
+            phantom: PhantomData,
+        }
+    }
+
+    fn new(p: CountedNonNullPtr<T>) -> Self {
+        Self {
+            ptr: AtomicUsize::new(Self::to_usize(p)),
+            phantom: PhantomData,
+        }
+    }
+
+    fn load(&self, order: Ordering) -> CountedNonNullPtr<T> {
+        Self::from_usize(self.ptr.load(order))
+    }
+
+    fn store(&self, p: CountedNonNullPtr<T>, order: Ordering) {
+        self.ptr.store(Self::to_usize(p), order)
+    }
+
+    fn swap(&self, p: CountedNonNullPtr<T>, order: Ordering) -> CountedNonNullPtr<T> {
+        Self::from_usize(self.ptr.swap(Self::to_usize(p), order))
+    }
+
+    fn compare_and_swap(
+        &self,
+        current: CountedNonNullPtr<T>,
+        new: CountedNonNullPtr<T>,
+        order: Ordering,
+    ) -> CountedNonNullPtr<T> {
+        Self::from_usize(
+            self.ptr.compare_and_swap(
+                Self::to_usize(current),
+                Self::to_usize(new),
+                order,
+            )
+        )
+    }
+
+    fn compare_exchange(
+        &self,
+        current: CountedNonNullPtr<T>,
+        new: CountedNonNullPtr<T>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<CountedNonNullPtr<T>, CountedNonNullPtr<T>> {
+        match self.ptr.compare_exchange(
+            Self::to_usize(current),
+            Self::to_usize(new),
+            success,
+            failure,
+        ) {
+            Ok(x) => Ok(Self::from_usize(x)),
+            Err(x) => Err(Self::from_usize(x)),
+        }
+    }
+
+    fn compare_exchange_weak(
+        &self,
+        current: CountedNonNullPtr<T>,
+        new: CountedNonNullPtr<T>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<CountedNonNullPtr<T>, CountedNonNullPtr<T>> {
+        match self.ptr.compare_exchange_weak(
+            Self::to_usize(current),
+            Self::to_usize(new),
+            success,
+            failure,
+        ) {
+            Ok(x) => Ok(Self::from_usize(x)),
+            Err(x) => Err(Self::from_usize(x)),
+        }
+    }
+
+}
+
+
+
+
+
+struct AtomicCountedPtr<T> {
+    ptr: AtomicUsize,
+    phantom: PhantomData<CountedPtr<T>>
+}
+
+impl<T> AtomicCountedPtr<T> {
+
+    fn to_usize(x: CountedPtr<T>) -> usize {
+        x.ptr
+    }
+
+    fn from_usize(x: usize) -> CountedPtr<T> {
+        CountedPtr {
+            ptr: x,
+            phantom: PhantomData,
+        }
+    }
+
+    fn new(p: CountedPtr<T>) -> Self {
+        Self {
+            ptr: AtomicUsize::new(Self::to_usize(p)),
+            phantom: PhantomData,
+        }
+    }
+
+    fn load(&self, order: Ordering) -> CountedPtr<T> {
+        Self::from_usize(self.ptr.load(order))
+    }
+
+    fn store(&self, p: CountedPtr<T>, order: Ordering) {
+        self.ptr.store(Self::to_usize(p), order)
+    }
+
+    fn swap(&self, p: CountedPtr<T>, order: Ordering) -> CountedPtr<T> {
+        Self::from_usize(self.ptr.swap(Self::to_usize(p), order))
+    }
+
+    fn compare_and_swap(
+        &self,
+        current: CountedPtr<T>,
+        new: CountedPtr<T>,
+        order: Ordering,
+    ) -> CountedPtr<T> {
+        Self::from_usize(
+            self.ptr.compare_and_swap(
+                Self::to_usize(current),
+                Self::to_usize(new),
+                order,
+            )
+        )
+    }
+
+    fn compare_exchange(
+        &self,
+        current: CountedPtr<T>,
+        new: CountedPtr<T>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<CountedPtr<T>, CountedPtr<T>> {
+        match self.ptr.compare_exchange(
+            Self::to_usize(current),
+            Self::to_usize(new),
+            success,
+            failure,
+        ) {
+            Ok(x) => Ok(Self::from_usize(x)),
+            Err(x) => Err(Self::from_usize(x)),
+        }
+    }
+
+    fn compare_exchange_weak(
+        &self,
+        current: CountedPtr<T>,
+        new: CountedPtr<T>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<CountedPtr<T>, CountedPtr<T>> {
+        match self.ptr.compare_exchange_weak(
+            Self::to_usize(current),
+            Self::to_usize(new),
+            success,
+            failure,
+        ) {
+            Ok(x) => Ok(Self::from_usize(x)),
+            Err(x) => Err(Self::from_usize(x)),
+        }
+    }
+
+}
 
 struct ArcInner<T : ?Sized> {
     strong : AtomicUsize,
@@ -43,42 +440,40 @@ struct ArcInner<T : ?Sized> {
 // reference count
 
 pub struct WeightedArc<T> {
-    ptr : NonZeroUsize, // Packed pointer
-    phantom : PhantomData<T>
+    ptr: CountedNonNullPtr<ArcInner<T>>
 }
 
 pub struct WeightedWeak<T> {
-    ptr : NonZeroUsize, // Packed pointer
-    phantom : PhantomData<T>
+    ptr : CountedNonNullPtr<ArcInner<T>>
 }
 
 impl<T> WeightedArc<T> {
 
     pub fn new(data: T) -> Self {
         Self {
-            ptr : NonZeroUsize::new(Box::into_raw(
-                Box::new(
-                    ArcInner {
-                        strong : AtomicUsize::new(N),
-                        weak : AtomicUsize::new(N),
-                        data : data,
-                    }
+            ptr: CountedNonNullPtr::new(
+                N,
+                Box::into_raw_non_null(
+                    Box::new(
+                        ArcInner {
+                            strong : AtomicUsize::new(N),
+                            weak : AtomicUsize::new(N),
+                            data : data,
+                        }
+                    )
                 )
-            ) as usize | ((N - 1) << SHIFT)).unwrap(),
-            phantom : PhantomData,
+            )
         }
     }
 
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
-        let p = (this.ptr.get() & MASK) as *const ArcInner<T>;
-        let n = this.ptr.get() >> SHIFT;
-        match this.inner().strong.compare_exchange(n + 1, 0, Release, Relaxed) {
+        let (n, p) = this.ptr.get();
+        match this.ptr.strong.compare_exchange(n, 0, Release, Relaxed) {
             Ok(_) => {
                 std::sync::atomic::fence(Acquire);
-                let data = unsafe { std::ptr::read(&(*p).data) };
+                let data = unsafe { std::ptr::read(&p.as_ref().data) };
                 let _weak : WeightedWeak<T> = WeightedWeak {
-                    ptr : NonZeroUsize::new(p as usize).unwrap(),
-                    phantom : PhantomData,
+                    ptr : CountedNonNullPtr::new(N, p),
                 };
                 std::mem::forget(this);
                 Ok(data)
@@ -87,16 +482,11 @@ impl<T> WeightedArc<T> {
         }
     }
 
-    fn inner(&self) -> &ArcInner<T> {
-        let p = (self.ptr.get() & MASK) as *const ArcInner<T>;
-        unsafe { &*p }
-    }
-
     pub fn into_raw(this: Self) -> *const T {
-        let n = this.ptr.get() >> SHIFT;
-        // Release all but one ownership
-        if n > 0 {
-            let m = this.inner().strong.fetch_sub(n, Relaxed);
+        let (n, _) = this.ptr.get();
+        if n > 1 {
+            // Release all but one ownership
+            let m = this.ptr.strong.fetch_sub(n - 1, Relaxed);
             debug_assert!(m > 0);
         }
         let ptr : *const T = &*this;
@@ -105,25 +495,26 @@ impl<T> WeightedArc<T> {
     }
 
     pub unsafe fn from_raw(ptr: *const T) -> Self {
-        // Todo: compute the alignment properly in case T has align > 8
+        let fake_ptr = 0 as *const ArcInner<T>;
+        let offset = &(*fake_ptr).data as *const T as usize;
+        let p = NonNull::new_unchecked(((ptr as usize) - offset) as *mut ArcInner<T>);
         Self {
-            ptr : NonZeroUsize::new(ptr as usize - 16).unwrap(),
-            phantom : PhantomData,
+            ptr : CountedNonNullPtr::new(1, p),
         }
     }
 
     pub fn downgrade(this: &Self) -> WeightedWeak<T> {
-        let mut cur = this.inner().weak.load(Relaxed);
+        let (_, p) = this.ptr.get();
+        let mut cur = this.ptr.weak.load(Relaxed);
         loop {
             if cur == std::usize::MAX {
                 // The weak count is locked by is_unique.  Spin.
-                cur = this.inner().weak.load(Relaxed);
+                cur = this.ptr.weak.load(Relaxed);
                 continue
             }
-            match this.inner().weak.compare_exchange_weak(cur, cur + N, Acquire, Relaxed) {
+            match this.ptr.weak.compare_exchange_weak(cur, cur + N, Acquire, Relaxed) {
                 Ok(_) => break WeightedWeak {
-                    ptr: NonZeroUsize::new(this.ptr.get() | !MASK).unwrap(),
-                    phantom: PhantomData,
+                    ptr: CountedNonNullPtr::new(N, p),
                 },
                 Err(old) => cur = old,
             }
@@ -136,7 +527,7 @@ impl<T> WeightedArc<T> {
     pub fn weak_bound(this: &Self) -> usize {
         // I don't understand why this load is SeqCst in std::sync::Arc.  I believe that SeqCst
         // synchronizes only with itself, not Acqure/Release.
-        let cnt = this.inner().weak.load(Relaxed);
+        let cnt = this.ptr.weak.load(Relaxed);
         if cnt == std::usize::MAX {
             // .weak is locked, so must have been N
             0
@@ -151,36 +542,38 @@ impl<T> WeightedArc<T> {
     // on a WeightedArc, a lower bound is 1.  Returns if and only if the WeightedArc was unique
     // at some time, but races against the upgrading of any WeightedWeaks
     pub fn stong_bound(this: &Self) -> usize {
-        let n = this.ptr.get() >> SHIFT;
+        let (n, _) = this.ptr.get();
         // I don't understand why this load is SeqCst in std::sync::Arc.  I beleive that SeqCst
         // synchronizes only with itself not Acquire/Release
-        let m = this.inner().strong.load(Relaxed);
+        let m = this.ptr.strong.load(Relaxed);
         m - n
     }
 
     unsafe fn drop_slow(&mut self) {
         // We have just set .strong to zero
-        let p = (self.ptr.get() & MASK) as *mut ArcInner<T>;
-        std::ptr::drop_in_place(&mut (*p).data);
-        if self.inner().weak.fetch_sub(N, Release) == N {
+        let (_, mut p) = self.ptr.get();
+        std::ptr::drop_in_place(&mut p.as_mut().data);
+        if self.ptr.weak.fetch_sub(N, Release) == N {
             // Upgrade memory order to synchronze with dropped WeightedWeaks on other threads
             std::sync::atomic::fence(Acquire);
             std::alloc::Global.dealloc(
-                std::ptr::NonNull::new(p as *mut u8).unwrap(),
-                std::alloc::Layout::for_value(self.inner())
+                std::ptr::NonNull::new_unchecked(p.as_ptr() as *mut u8),
+                std::alloc::Layout::for_value(p.as_ref())
             );
         }
     }
 
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
-        this.ptr.get() & MASK == other.ptr.get() & MASK
+        let (_, p) = this.ptr.get();
+        let (_, q) = other.ptr.get();
+        p == q
     }
 
     fn is_unique(&mut self) -> bool {
-        if self.inner().weak.compare_exchange(N, std::usize::MAX, Acquire, Relaxed).is_ok() {
-            let n = self.ptr.get() >> SHIFT + 1;
-            let u = self.inner().strong.load(Relaxed) == n;
-            self.inner().weak.store(N, Release);
+        if self.ptr.weak.compare_exchange(N, std::usize::MAX, Acquire, Relaxed).is_ok() {
+            let (n, _) = self.ptr.get();
+            let u = self.ptr.strong.load(Relaxed) == n;
+            self.ptr.weak.store(N, Release);
             u
         } else {
             false
@@ -189,8 +582,7 @@ impl<T> WeightedArc<T> {
 
     pub fn get_mut(&mut self) -> Option<&mut T> {
         if self.is_unique() {
-            let p = (self.ptr.get() & MASK) as *mut ArcInner<T>;
-            unsafe { Some(&mut (*p).data) }
+            Some(&mut self.ptr.data)
         } else {
             None
         }
@@ -198,25 +590,22 @@ impl<T> WeightedArc<T> {
 
     // Clone self, sharing its weight and sometimes avoiding touching the reference count
     pub fn split(&mut self) -> Self {
-        let n = (self.ptr.get() >> SHIFT) + 1;
-        let p = self.ptr.get() & MASK;
+        let (n, p) = self.ptr.get();
         if n == 1 {
             // We have no spare weight, we have to hit the global count so max it
-            self.inner().strong.fetch_add(N * 2 - 1, Relaxed);
-            self.ptr = NonZeroUsize::new(p | !MASK).unwrap();
+            self.ptr.strong.fetch_add(N * 2 - 1, Relaxed);
+            self.ptr.set_count(N);
             WeightedArc {
                 ptr: self.ptr,
-                phantom: PhantomData,
             }
         } else {
             // We have enough weight to share
             let m = n >> 1;
-            let a = ((n - m) - 1) << SHIFT;
-            let b = (m - 1) << SHIFT;
-            self.ptr = NonZeroUsize::new(p | a).unwrap();
+            let a = (n - m) << SHIFT;
+            let b = m << SHIFT;
+            self.ptr.set_count(a);
             WeightedArc {
-                ptr: NonZeroUsize::new(p | b).unwrap(),
-                phantom: PhantomData,
+                ptr: CountedNonNullPtr::new(b, p),
             }
         }
     }
@@ -225,29 +614,35 @@ impl<T> WeightedArc<T> {
     // global reference count
     pub fn merge(&mut self, other : Self) {
         assert!(WeightedArc::ptr_eq(self, &other));
-        let n = (self.ptr.get() >> SHIFT) + 1;
-        let n2 = (other.ptr.get() >> SHIFT) + 1;
+        let (n, p) = self.ptr.get();
+        let (n2, p2) = other.ptr.get();
+        assert!(p.as_ptr() == p2.as_ptr());
         let n3 = n + n2;
-        let p = self.ptr.get() & MASK;
         if n3 > N {
             // We have to release the excess
             // This can be relaxed because we know we are not releasing the last owner
-            self.inner().strong.fetch_sub(n3 - N, Relaxed);
-            self.ptr = NonZeroUsize::new(p | !MASK).unwrap();
+            self.ptr.strong.fetch_sub(n3 - N, Relaxed);
+            self.ptr.set_count(N);
         } else {
             // We can consolidate all the ownership into ourself
-            let n4 = (n3 - 1) << SHIFT;
-            self.ptr = NonZeroUsize::new(p | n4).unwrap();
+            self.ptr.set_count(n3);
         }
         std::mem::forget(other);
     }
 
     pub fn fortify(&mut self) {
-        let n = (self.ptr.get() >> SHIFT) + 1;
-        let p = self.ptr.get() & MASK;
+        let (n, _) = self.ptr.get();
         if n < N {
-            self.inner().strong.fetch_add(N - n, Relaxed);
-            self.ptr = NonZeroUsize::new(p | !MASK).unwrap();
+            self.ptr.strong.fetch_add(N - n, Relaxed);
+            self.ptr.set_count(N);
+        }
+    }
+
+    fn condition(&mut self) {
+        let (n, _) = self.ptr.get();
+        if n == 1 {
+            self.ptr.strong.fetch_add(N - 1, Relaxed);
+            self.ptr.set_count(N);
         }
     }
 
@@ -257,10 +652,8 @@ impl<T : Clone> WeightedArc<T> {
 
     pub fn make_mut(this: &mut Self) -> &mut T {
         // This function is very subtle
-
-        let n = this.ptr.get() >> SHIFT;
-        let p = (this.ptr.get() & MASK) as *mut ArcInner<T>;
-        if this.inner().strong.compare_exchange(n, 0, Acquire, Relaxed).is_err() {
+        let (n, p) = this.ptr.get();
+        if this.ptr.strong.compare_exchange(n, 0, Acquire, Relaxed).is_err() {
             // Another strong pointer exists, so clone .data into a new ArcInner
             *this = WeightedArc::new((**this).clone());
         } else {
@@ -271,18 +664,17 @@ impl<T : Clone> WeightedArc<T> {
             // Weak cannot be locked since it is only locked when in a method on this object
             // which we have exclusive access to and have just shown is alone
 
-            if this.inner().weak.load(Relaxed) != N {
+            if this.ptr.weak.load(Relaxed) != N {
                 // There are weak pointers to the control block.
                 // We need to move the value and release N from weak.
                 let _weak : WeightedWeak<T> = WeightedWeak {
-                    ptr : NonZeroUsize::new(this.ptr.get() | !MASK).unwrap(),
-                    phantom : PhantomData,
+                    ptr : CountedNonNullPtr::new(N, p),
                 };
 
                 unsafe {
                     // Move the data into a new WeightedArc, leaving the old one with destroyed
                     // data, just as if it was dropped
-                    let mut swap = WeightedArc::new(std::ptr::read(&(*p).data));
+                    let mut swap = WeightedArc::new(std::ptr::read(&p.as_ref().data));
                     std::mem::swap(this, &mut swap);
                     mem::forget(swap);
                 }
@@ -293,13 +685,12 @@ impl<T : Clone> WeightedArc<T> {
                 // and are a unique reference to this arc, so downgrade is not being called on us
                 // and after that, the weak count was zero
                 // thus we are the only reference
-                this.inner().strong.store(N, Release);
-                this.ptr = NonZeroUsize::new(this.ptr.get() | !MASK).unwrap();
+                this.ptr.strong.store(N, Release);
             }
 
         }
         // Return whatever we point to now
-        unsafe { &mut (*((this.ptr.get() & MASK) as *mut ArcInner<T>)).data }
+        &mut this.ptr.data
     }
 
 
@@ -310,11 +701,10 @@ impl<T : Clone> WeightedArc<T> {
 // have a &mut self
 impl<T> Clone for WeightedArc<T> {
     fn clone(&self) -> Self {
-        self.inner().strong.fetch_add(N, Relaxed);
-        let p = self.ptr.get();
+        self.ptr.strong.fetch_add(N, Relaxed);
+        let (_, p) = self.ptr.get();
         Self {
-            ptr: NonZeroUsize::new(p | !MASK).unwrap(),
-            phantom: PhantomData,
+            ptr: CountedNonNullPtr::new(N, p),
         }
     }
 }
@@ -323,15 +713,15 @@ impl<T> Clone for WeightedArc<T> {
 impl<T> Deref for WeightedArc<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        &self.inner().data
+        &self.ptr.data
     }
 }
 
 impl<T> Drop for WeightedArc<T> {
     fn drop(&mut self) {
-        let n = self.ptr.get() >> SHIFT + 1;
-        if self.inner().strong.fetch_sub(n, Release) != n {
-            return;
+        let (n, _) = self.ptr.get();
+        if self.ptr.strong.fetch_sub(n, Release) != n {
+            return
         }
         std::sync::atomic::fence(Acquire);
         unsafe { self.drop_slow() }
@@ -342,34 +732,39 @@ impl<T> Drop for WeightedArc<T> {
 
 impl<T> WeightedWeak<T> {
 
-
     pub fn new() -> WeightedWeak<T> {
         // A standalone WeightedWeak is created in a half-destroyed state, can never be upgraded
         // and isn't very useful!
         Self {
-            ptr : NonZeroUsize::new(Box::into_raw(
-                Box::<ArcInner<T>>::new(
-                    ArcInner {
-                        strong : AtomicUsize::new(0),
-                        weak : AtomicUsize::new(N),
-                        data : unsafe { std::mem::uninitialized() },
-                    }
-                )
-            ) as usize | !MASK).unwrap(),
-            phantom : PhantomData,
+            ptr : CountedNonNullPtr::new(
+                N,
+                unsafe {
+                    Box::into_raw_non_null(
+                        Box::<ArcInner<T>>::new(
+                            ArcInner {
+                                strong : AtomicUsize::new(0),
+                                weak : AtomicUsize::new(N),
+                                data : std::mem::uninitialized(),
+                            }
+                        )
+                    )
+                }
+            ),
         }
     }
 
     pub fn upgrade(&self) -> Option<WeightedArc<T>> {
-        let mut s = self.inner().strong.load(Relaxed);
+        let mut s = self.ptr.strong.load(Relaxed);
         loop {
-            if s == 0 { return None; }
-            match self.inner().strong.compare_exchange_weak(s, s + N, Relaxed, Relaxed) {
+            if s == 0 {
+                break None
+            }
+            match self.ptr.strong.compare_exchange_weak(s, s + N, Relaxed, Relaxed) {
                 Ok(_) => {
-                    return Some(
+                    let (_, p) = self.ptr.get();
+                    break Some(
                         WeightedArc {
-                            ptr: NonZeroUsize::new(self.ptr.get() | !MASK).unwrap(),
-                            phantom: PhantomData,
+                            ptr: CountedNonNullPtr::new(N, p),
                         }
                     )
                 },
@@ -378,18 +773,14 @@ impl<T> WeightedWeak<T> {
         }
     }
 
-    fn inner(&self) -> &ArcInner<T> {
-        return unsafe { &*((self.ptr.get() & MASK) as *const ArcInner<T>) }
-    }
-
 }
 
 impl<T> Clone for WeightedWeak<T> {
     fn clone(&self) -> Self {
-        self.inner().weak.fetch_add(N, Relaxed);
+        self.ptr.weak.fetch_add(N, Relaxed);
+        let (_, p) = self.ptr.get();
         Self {
-            ptr: NonZeroUsize::new(self.ptr.get() | !MASK).unwrap(),
-            phantom: PhantomData,
+            ptr: CountedNonNullPtr::new(N, p),
         }
     }
 }
@@ -399,7 +790,6 @@ impl<T : std::fmt::Debug> std::fmt::Debug for WeightedArc<T> {
         std::fmt::Debug::fmt(&**self, f)
     }
 }
-
 
 impl<T : std::cmp::PartialEq> std::cmp::PartialEq for WeightedArc<T> {
     fn eq(&self, other: &Self) -> bool {
@@ -412,6 +802,101 @@ impl<T : std::cmp::Eq> std::cmp::Eq for WeightedArc<T> {
 
 
 
+struct AtomicOptionWeightedArc<T> {
+    ptr: AtomicCountedPtr<ArcInner<T>>,
+}
+
+impl<T> AtomicOptionWeightedArc<T> {
+
+    fn to_ptr(p: Option<WeightedArc<T>>) -> CountedPtr<ArcInner<T>> {
+        match p {
+            None => CountedPtr { ptr: 0, phantom: PhantomData },
+            Some(mut q) => {
+                // Make sure we have more than 1 ownership, so we can be installed
+                q.condition();
+                let x : usize = q.ptr.ptr.get();
+                std::mem::forget(q);
+                CountedPtr { ptr: x, phantom: PhantomData, }
+            },
+        }
+    }
+
+    fn from_ptr(p: CountedPtr<ArcInner<T>>) -> Option<WeightedArc<T>> {
+        match p.ptr {
+            0 => None,
+            x => Some(
+                WeightedArc {
+                    ptr: CountedNonNullPtr {
+                        ptr: unsafe { NonZeroUsize::new_unchecked(x) },
+                        phantom: PhantomData,
+                    }
+                }
+            )
+        }
+    }
+
+    fn new(p: Option<WeightedArc<T>>) -> Self {
+        Self { ptr: AtomicCountedPtr::new(Self::to_ptr(p)) }
+    }
+
+    fn swap(&self, new: Option<WeightedArc<T>>) -> Option<WeightedArc<T>> {
+        Self::from_ptr(self.ptr.swap(Self::to_ptr(new), AcqRel))
+    }
+
+    fn store(&self, new: Option<WeightedArc<T>>) {
+        self.swap(new);
+    }
+
+    fn load(&self) -> Option<WeightedArc<T>> {
+        let mut expected = self.ptr.load(Relaxed);
+        let mut desired : CountedPtr<ArcInner<T>>;
+        loop {
+            let (n, p) = expected.get();
+            if p.is_null() {
+                return None
+            }
+            if n == 1 {
+                // Spin until the count is increased
+                std::thread::yield_now();
+                expected = self.ptr.load(Relaxed);
+                continue
+            }
+            desired = CountedPtr::new(n - 1, p);
+            match self.ptr.compare_exchange_weak(
+                expected,
+                desired,
+                Acquire,
+                Relaxed
+            ) {
+                Ok(_) => break,
+                Err(e) => expected = e,
+            }
+        }
+        expected = desired;
+        let (n, _) = expected.get();
+        if n == 1 {
+            // We have weight 1 in our load, and weight 1 in the atomic, locking it against
+            // any further loads.  We need to get more weight for the atomic, so we also get
+            // more for the return value
+            expected.strong.fetch_add(2 * (N - 1), Relaxed);
+            desired.set_count(N);
+            match self.ptr.compare_exchange(expected, desired, Release, Relaxed) {
+                Ok(_) => {},
+                Err(_) => {
+                    // We failed because the expected value was not there, so we aren't blocked
+                    // anyway.  Give back the excess weight.
+                    expected.strong.fetch_sub(N - 1, Relaxed);
+                }
+            }
+            // No matter what, we have strengthened the
+            expected.set_count(N);
+        } else {
+            expected.set_count(1);
+        }
+        Self::from_ptr(expected)
+    }
+
+}
 
 
 mod tests {
@@ -420,20 +905,23 @@ mod tests {
     #[test]
     fn test_new() {
         {
+            assert!(std::mem::size_of::<Option<WeightedArc<usize>>>() == 8);
+        }
+        {
             let a = WeightedArc::new(0);
             assert!(*a == 0);
         }
         {
             let a = WeightedArc::new(4);
-            assert!(WeightedArc::ptr_eq(a, a));
+            assert!(WeightedArc::ptr_eq(&a, &a));
             let b = WeightedArc::new(5);
-            assert!(WeightedArc::ptr_eq(a, b));
+            assert!(!WeightedArc::ptr_eq(&a, &b));
         }
         {
             let a = WeightedArc::new(3);
             let b = a.clone();
             assert_eq!(a, b);
-            assert!(WeightedArc::ptr_eq(a, b));
+            assert!(WeightedArc::ptr_eq(&a, &b));
         }
         {
             {
