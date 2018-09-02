@@ -63,29 +63,23 @@
 #![feature(extern_prelude)]
 
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::Ordering::Acquire;
-use std::sync::atomic::Ordering::AcqRel;
-use std::sync::atomic::Ordering::Release;
 use std::sync::atomic::Ordering;
-
-use std::marker::PhantomData;
-
-use std::option::Option;
+use std::sync::atomic::Ordering::{Relaxed, Acquire, AcqRel, Release};
 
 use std::mem;
+
+use std::marker::PhantomData;
+use std::ptr::NonNull;
 use std::num::NonZeroUsize;
+use std::option::Option;
 
 use std::alloc::Alloc;
-use std::ptr::NonNull;
 
-use std::ops::Deref;
-use std::ops::DerefMut;
+use std::ops::{Deref, DerefMut};
 use std::clone::Clone;
-
 use std::fmt::Debug;
-use std::cmp::Eq;
-use std::cmp::PartialEq;
+use std::cmp::{PartialEq, Eq, PartialOrd, Ord};
+use std::hash::{Hash, Hasher};
 
 // # Pointer packing
 //
@@ -567,9 +561,9 @@ impl<T> WeightedArc<T> {
                 cur = this.ptr.weak.load(Relaxed);
                 continue
             }
-            match this.ptr.weak.compare_exchange_weak(cur, cur + 1, Acquire, Relaxed) {
+            match this.ptr.weak.compare_exchange_weak(cur, cur + N, Acquire, Relaxed) {
                 Ok(_) => break WeightedWeak {
-                    ptr: CountedNonNullPtr::new(1, p),
+                    ptr: CountedNonNullPtr::new(N, p),
                 },
                 Err(old) => cur = old,
             }
@@ -777,8 +771,11 @@ impl<T> WeightedArc<T> {
     /// use barc::WeightedArc;
     ///
     /// let mut a = WeightedArc::new(2);
+    /// let n = WeightedArc::strong_count(&a);
     /// let b = a.clone_mut();
     /// assert!(WeightedArc::ptr_eq(&a, &b));
+    /// let m = WeightedArc::strong_count(&a);
+    /// assert_eq!(n, m);
     /// ```
     ///
     pub fn clone_mut(&mut self) -> Self {
@@ -882,8 +879,26 @@ impl<T> WeightedArc<T> {
 
 impl<T : Clone> WeightedArc<T> {
 
+    /// Provide a `&mut T` by cloning the managed object if necessary
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::WeightedArc;
+    ///
+    /// let mut a = WeightedArc::new(1);
+    /// *WeightedArc::make_mut(&mut a) += 1;
+    /// assert_eq!(*a, 2);
+    /// let b = a.clone();
+    /// assert!(WeightedArc::ptr_eq(&a, &b));
+    /// *WeightedArc::make_mut(&mut a) += 1;
+    /// assert_eq!(*b, 2);
+    /// assert_eq!(*a, 3);
+    /// assert!(!WeightedArc::ptr_eq(&a, &b));
+    /// ```
+    ///
     pub fn make_mut(this: &mut Self) -> &mut T {
-        // This function is very subtle
+        // This function is very subtle!
         let (n, p) = this.ptr.get();
         if this.ptr.strong.compare_exchange(n, 0, Acquire, Relaxed).is_err() {
             // Another strong pointer exists, so clone .data into a new ArcInner
@@ -933,6 +948,20 @@ impl<T : Clone> WeightedArc<T> {
 // Because WeightedArc is Sync we can't touch the local count when cloning.  Use split when we
 // have a &mut self
 impl<T> Clone for WeightedArc<T> {
+
+    /// See [`std::sync::Arc::clone`]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::WeightedArc;
+    ///
+    /// let a = WeightedArc::new(1);
+    /// let b = a.clone();
+    /// assert!(WeightedArc::ptr_eq(&a, &b));
+    /// assert_eq!(*a, *b);
+    /// ```
+    ///
     fn clone(&self) -> Self {
         self.ptr.strong.fetch_add(N, Relaxed);
         let (_, p) = self.ptr.get();
@@ -943,6 +972,18 @@ impl<T> Clone for WeightedArc<T> {
 }
 
 impl<T: Default> Default for WeightedArc<T> {
+
+    /// See [`std::sync::Arc::default`]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::WeightedArc;
+    ///
+    /// let a = WeightedArc::<usize>::default();
+    /// assert_eq!(*a, usize::default());
+    /// ```
+    ///
     fn default() -> Self {
         WeightedArc::new(T::default())
     }
@@ -966,6 +1007,21 @@ impl<T> Drop for WeightedArc<T> {
     }
 }
 
+impl<T : PartialEq<T>> PartialEq<WeightedArc<T>> for WeightedArc<T> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl<T : Eq> Eq for WeightedArc<T> {
+}
+
+impl<T : Hash> Hash for WeightedArc<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (**self).hash(state)
+    }
+}
+
 unsafe impl<T: Send + Sync> Send for WeightedArc<T> {}
 unsafe impl<T: Send + Sync> Sync for WeightedArc<T> {}
 
@@ -973,8 +1029,20 @@ unsafe impl<T: Send + Sync> Sync for WeightedArc<T> {}
 
 impl<T> WeightedWeak<T> {
 
-    /// Creates a control block without an object.  It can never be upgraded.  Only useful for
-    /// providing an initial non-null state?  Consider Option<WeightedWeak<T>>.
+    /// Create an alreay expired `WeightedWeak`
+    ///
+    /// See [`std::sync::Weak::new`]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::WeightedWeak;
+    ///
+    /// let a = WeightedWeak::<usize>::new();
+    /// assert_eq!(WeightedWeak::upgrade(&a), None);
+    ///
+    /// ```
+    ///
     pub fn new() -> WeightedWeak<T> {
         // A standalone WeightedWeak is created in a half-destroyed state, can never be upgraded
         // and isn't very useful!
@@ -996,9 +1064,20 @@ impl<T> WeightedWeak<T> {
         }
     }
 
-    /// Attempt to make a strong reference to the object.  This will only succeed if there is
-    /// somewhere else a WeightedArc keeping the object alive.  Races with dropping those other
-    // WeightedArcs.
+    /// See [`std::sync::Weak::upgrade`]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::{WeightedArc, WeightedWeak};
+    ///
+    /// let a = WeightedArc::new(7);
+    /// let b = WeightedArc::downgrade(&a);
+    /// assert_eq!(WeightedWeak::upgrade(&b), Some(a));
+    /// // a is dropped
+    /// assert_eq!(WeightedWeak::upgrade(&b), None);
+    /// ```
+    ///
     pub fn upgrade(&self) -> Option<WeightedArc<T>> {
         let mut s = self.ptr.strong.load(Relaxed);
         loop {
@@ -1019,7 +1098,23 @@ impl<T> WeightedWeak<T> {
         }
     }
 
-    fn clone_mut(&mut self) -> Self {
+    /// Clone from `&mut WeightedWeak` without touching the weak reference count.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::{WeightedArc, WeightedWeak};
+    ///
+    /// let a = WeightedArc::new(7);
+    /// let mut b = WeightedArc::downgrade(&a);
+    /// let n = WeightedArc::weak_count(&a);
+    /// let c = b.clone_mut();
+    /// let m = WeightedArc::weak_count(&a);
+    /// assert_eq!(n, m);
+    /// assert_eq!(WeightedWeak::upgrade(&c), Some(a));
+    /// ```
+    ///
+    pub fn clone_mut(&mut self) -> Self {
         let (n, p) = self.ptr.get();
         if n == 1 {
             self.ptr.weak.fetch_add(N + N - n, Relaxed);
@@ -1042,6 +1137,20 @@ impl<T> WeightedWeak<T> {
 }
 
 impl<T> Clone for WeightedWeak<T> {
+
+    /// See [`std::sync::Weak::clone`]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::{WeightedArc, WeightedWeak};
+    ///
+    /// let a = WeightedArc::new(7);
+    /// let b = WeightedArc::downgrade(&a);
+    /// let c = b.clone();
+    /// assert_eq!(WeightedWeak::upgrade(&c), Some(a));
+    /// ```
+    ///
     fn clone(&self) -> Self {
         // The weak count cannot be locked because it is only locked if there are no WeightedWeak
         // objects
@@ -1059,14 +1168,8 @@ impl<T : Debug> Debug for WeightedArc<T> {
     }
 }
 
-impl<T : PartialEq> PartialEq for WeightedArc<T> {
-    fn eq(&self, other: &Self) -> bool {
-        **self == **other
-    }
-}
-
-impl<T : Eq> Eq for WeightedArc<T> {
-}
+unsafe impl<T: Send + Sync> Send for WeightedWeak<T> {}
+unsafe impl<T: Send + Sync> Sync for WeightedWeak<T> {}
 
 /// Lock-free concurrent `Option<WeightedArc<T>>`
 ///
@@ -1118,29 +1221,82 @@ impl<T> AtomicOptionWeightedArc<T> {
         }
     }
 
+    /// Constructs a new `AtomicOptionWeightedArc`
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::*;
+    ///
+    /// let a = WeightedArc::new(3);
+    /// let b = AtomicOptionWeightedArc::new(Some(a.clone()));
+    /// assert_eq!(b.load(), Some(a));
+    /// let c = AtomicOptionWeightedArc::<usize>::new(None);
+    /// assert_eq!(c.load(), None);
+    /// ```
+    ///
     pub fn new(p: Option<WeightedArc<T>>) -> Self {
         Self { ptr: AtomicCountedPtr::new(Self::to_ptr(p)) }
     }
 
-    /// Provide non-atomic access when not shared.
-    /// Not to be confused with [`WeightedArc::get_mut`]
+    /// Non-atomic access to an unshared `AtomicOptionWeightedArc`
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::*;
+    ///
+    /// let a = WeightedArc::new(3);
+    /// let mut b = AtomicOptionWeightedArc::new(Some(a.clone()));
+    /// assert_eq!(*b.get_mut(), Some(a));
+    /// b.store(None);
+    /// assert_eq!(*b.get_mut(), None);
+    /// ```
+    ///
     pub fn get_mut(&mut self) -> &mut Option<WeightedArc<T>> {
         // Rely on layout compatibility
         unsafe { &mut *(self.ptr.get_mut() as *mut CountedPtr<ArcInner<T>> as *mut Option<WeightedArc<T>>) }
     }
 
-    /// Consume, returning the inner value.
-    /// Not to be confused with [`WeightedArc::try_unwrap`]
+    /// Consume the `AtomicOptionWeightedArc` returning the stored value.
+    /// Not to be confused with [`WeightedArc::try_unwrap`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::*;
+    ///
+    /// let a = WeightedArc::new(3);
+    /// let b = AtomicOptionWeightedArc::new(Some(a.clone()));
+    /// assert_eq!(b.into_inner(), Some(a));
+    /// let c = AtomicOptionWeightedArc::<usize>::new(None);
+    /// assert_eq!(c.into_inner(), None);
+    /// ```
+    ///
     pub fn into_inner(mut self) -> Option<WeightedArc<T>> {
         let a = Self::from_ptr(*self.ptr.get_mut());
         std::mem::forget(self);
         a
     }
 
-    /// Loading is the key operation for the structure.
+    /// Atomically load the stored `Option<WeightedArc<T>>`
     ///
-    /// Typically a load and looping compare_exchange_weak, locking only when the counter is
-    /// exhausted after 64k consecutive loads
+    /// # Implementation
+    ///
+    /// Typically lock-free
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::*;
+    ///
+    /// let a = WeightedArc::new(3);
+    /// let b = AtomicOptionWeightedArc::new(Some(a.clone()));
+    /// assert_eq!(b.load(), Some(a));
+    /// b.store(None);
+    /// assert_eq!(b.load(), None);
+    /// ```
+    ///
     pub fn load(&self) -> Option<WeightedArc<T>> {
 
         // load is almost exactly fetch_sub(1 << SHIFT, Acquire)
@@ -1199,16 +1355,55 @@ impl<T> AtomicOptionWeightedArc<T> {
         Self::from_ptr(expected)
     }
 
-    /// Always lock-free
-    fn store(&self, new: Option<WeightedArc<T>>) {
+    /// Atomically store a value.  The previous value is dropped.
+    ///
+    /// # Safety
+    ///
+    /// Always lock-free.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::*;
+    ///
+    /// let a = WeightedArc::new(7);
+    /// let b = AtomicOptionWeightedArc::new(Some(a.clone()));
+    /// b.store(None);
+    /// assert_eq!(b.load(), None);
+    /// b.store(Some(a.clone()));
+    /// assert_eq!(b.load(), Some(a));
+    /// let c = WeightedArc::new(8);
+    /// b.store(Some(c.clone()));
+    /// assert_eq!(b.load(), Some(c));
+    /// ```
+    ///
+    pub fn store(&self, new: Option<WeightedArc<T>>) {
 
         // store is swap, dropping the old value
 
         self.swap(new);
     }
 
-    /// Always lock-free
-    fn swap(&self, new: Option<WeightedArc<T>>) -> Option<WeightedArc<T>> {
+    /// Atomically swap a value.  The previous value is returned.
+    ///
+    /// # Safety
+    ///
+    /// Always lock-free.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::*;
+    ///
+    /// let a = WeightedArc::new(7);
+    /// let b = AtomicOptionWeightedArc::new(Some(a.clone()));
+    /// let mut c = b.swap(None);
+    /// assert_eq!(c, Some(a.clone()));
+    /// c = b.swap(Some(a.clone()));
+    /// assert_eq!(c, None);
+    /// ```
+    ///
+    pub fn swap(&self, new: Option<WeightedArc<T>>) -> Option<WeightedArc<T>> {
 
         // swap is simply an atomic swap.  The conversion of new to a CountedPtr will increase its
         // weight if it is low.
@@ -1216,7 +1411,7 @@ impl<T> AtomicOptionWeightedArc<T> {
         Self::from_ptr(self.ptr.swap(Self::to_ptr(new), AcqRel))
     }
 
-    /// See compare_exchange
+    /// See [`AtomicOptionWeightedArc::compare_and_swap`].
     pub fn compare_and_swap(
         &self,
         current: Option<WeightedArc<T>>,
@@ -1228,8 +1423,24 @@ impl<T> AtomicOptionWeightedArc<T> {
         }
     }
 
-    /// Typically a load and looping compare_exchange_weak, spinning only when the counter is
-    /// exhausted
+    /// Atomic compare exchange.  Typically lock-free.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::*;
+    /// let a = WeightedArc::new(7);
+    /// let b = AtomicOptionWeightedArc::new(Some(a.clone()));
+    /// let mut c = b.compare_exchange(Some(a.clone()), None);
+    /// assert_eq!(c, Ok(Some(a.clone())));
+    /// c = b.compare_exchange(Some(a.clone()), None);
+    /// assert_eq!(c, Err(None));
+    /// c = b.compare_exchange(None, Some(a.clone()));
+    /// assert_eq!(c, Ok(None));
+    /// c = b.compare_exchange(None, Some(a.clone()));
+    /// assert_eq!(c, Err(Some(a)));
+    /// ```
+    ///
     pub fn compare_exchange(&self, current: Option<WeightedArc<T>>, new: Option<WeightedArc<T>>)
     -> Result<Option<WeightedArc<T>>, Option<WeightedArc<T>>> {
 
@@ -1325,6 +1536,10 @@ impl<T> AtomicOptionWeightedArc<T> {
         }
     }
 
+    /// See [`AtomicOptionWeightedArc::compare_exchange`]
+    ///
+    /// The current implementation just calls `compare_exchange`, as there is not much to be
+    /// gained from allowing spurious failures.
     pub fn compare_exchange_weak(
         &self,
         current: Option<WeightedArc<T>>,
@@ -1845,6 +2060,7 @@ mod tests {
     ///
     /// The test system should be thread-safe but requires the use of scoped threads.
 
+    #[derive(Debug)]
     struct Cage {
         counter: Arc<AtomicIsize>,
     }
@@ -2049,6 +2265,24 @@ mod tests {
             assert!(WeightedArc::ptr_eq(&d.unwrap(), &a));
             let e = c.compare_and_swap(Some(a.clone()), Some(b.clone()));
             assert!(WeightedArc::ptr_eq(&e.unwrap(), &b));
+        }
+        {
+            let cage = Cage::new();
+            let a = WeightedArc::new(cage.hatch(1));
+            let b = WeightedArc::new(cage.hatch(2));
+            let c = AtomicOptionWeightedArc::new(Some(a.clone()));
+            let d = c.compare_exchange(Some(a.clone()), Some(b.clone()));
+            assert_eq!(d, Ok(Some(a.clone())));
+            let e = c.compare_exchange(Some(a.clone()), Some(b.clone()));
+            assert_eq!(e, Err(Some(b.clone())));
+            let f = c.compare_exchange(None, Some(a.clone()));
+            assert_eq!(f, Err(Some(b.clone())));
+            let g = c.compare_exchange(Some(b.clone()), None);
+            assert_eq!(g, Ok(Some(b.clone())));
+            let h = c.compare_exchange(Some(a.clone()), None);
+            assert_eq!(h, Err(None));
+            let i = c.compare_exchange(None, Some(a.clone()));
+            assert_eq!(i, Ok(None));
         }
     }
 }

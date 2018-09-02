@@ -6,6 +6,9 @@ use std::clone::Clone;
 
 // Singly-linked-list Node for a simple unbounded concurrent Stack
 
+// Todo: support non-cloning types by putting them behind an AtomicOptionWeightedArc themselves;
+// they can then be snatched from the Node on pop.
+
 struct Node<T : Debug> {
     next: Option<WeightedArc<Node<T>>>,
     value: T,
