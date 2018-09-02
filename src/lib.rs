@@ -1,38 +1,62 @@
-//! # Lock-free atomic Arc for 64-bit architectures
+//! # Lock-free atomic `Arc` for 64-bit architectures
 //!
 //! This crate provides a lock-free atomic smart pointer, a useful building block for lock-free
-//! concurrent data structures.  WeightedArc is a drop-in replacement for Arc, and
-//! AtomicWeightedArc provides the interface of the std::sync::atomic types for it.  For example,
-//! we can compare_exchange WeightedArcs.
+//! concurrent data structures.  `WeightedArc` is a drop-in replacement for [`std::sync::Arc`], and
+//! `AtomicWeightedArc` provides the interface of the [`std::sync::atomic`] types for it.
+//! For example, we provide a lock-free [`AtomicWeightedArc::compare_exchange`].
 //!
-//! WeightedArc is implemented with what is variously called external, distributed or weighted
-//! reference counting.  Each WeightedArc packs a count into the spare bits of its pointer, marking
-//! how many units of ownership it possesses, with the global strong count in the control block
-//! being the total of all extant WeightedArc counts.  We can clone a WeightedArc by transferring
-//! some of its count to the clone, without touching the reference count.  This allows us to
-//! perform an atomic load by subtracting a constant from a one pointer-sized atomic value.
+//! `WeightedArc` is implemented with what is variously called external, distributed or weighted
+//! reference counting.
+//! Each `WeightedArc` packs a count into the spare bits of its pointer member,
+//! marking how many units of ownership it possesses,
+//! with the global strong count in the control block being the total of all extant `WeightedArc` counts.
+//! We can clone a `WeightedArc` by transferring some of its weight to the clone,
+//! without touching the reference count.
+//! This allows us to perform an atomic load by subtracting a constant from a pointer-sized atomic
+//! value.
 //!
-//! Rarely (after 64k consecutive loads) the counter is depleted, and we must spin until the
-//! thread that depleted it requests
-//! more ownership from the global strong count and updates the atomic.  The load and
-//! compare_exchange family methods are not atomic in this case.
+//! Rarely (after 64k consecutive loads or failed compare_exchanges) the counter is depleted,
+//! and we must spin until the thread that depleted it requests more ownership from the global
+//! strong count and updates the atomic.
+//! The load and compare_exchange family methods are not lock-free in this case.
 //!
-//! The crate also provides AtomicOptionWeightedArc, which seems more useful in practice, and
-//! WeightedWeak, AtomicWeightedWeak and AtomicOptionWeightedWeak, all implemented identically.
+//! The crate also provides `AtomicOptionWeightedArc`, which seems more useful in practice, and
+//! `WeightedWeak`, `AtomicWeightedWeak` and `AtomicOptionWeightedWeak`, all implemented similarly.
 //!
-//! The crate relies heavily on std::sync::Arc and folly::AtomicSharedPtr
+//! The techniques used in this crate are drawn from std::sync::Arc and the C++ folly::AtomicSharedPtr
+//!
+//! (Todo: How to appropriately credit?)
 //!
 //! Drawbacks of WeightedArc relative to std::sync::Arc are:
-//! * Less tested
-//! * Small cost to mask the pointer on each access?
+//! * T must be Sized, preventing WeightedArcs from directly storing trait objects and slices
+//! (workaround with WeightedArc<Box<T>>).  This is because unsized types use fat pointers that
+//! do not fit in 64-bit atomics.
 //! * The strong_count and weak_count become upper bounds (but note there was no way to use these
-//!   functions safely anyway)
+//!   functions safely anyway).  Todo, should we still supply strong_count and weak_count to facilitate
+//!   drop-in replacement?
+//! * Cost to mask the pointer on each access, probably insignificant.
+//! * Less tested.  Arc is notoriously difficult to get right and presumably there are bugs in
+//!   WeightedArc.
 //!
 //! Drawbacks relative to Mutex<Arc> are:
 //! * Uncontended performance?
+//!
+//! # Safety
+//!
+//! The implementation inherently relies on architecture-specific details of how pointers are
+//! stored, and the library is not available on incompatible architectures.  We support
+//! x86_64 and AArch64, covering the majority of desktop and mobile devices (servers?).  In
+//! debug mode we also validate that all set bits of pointers lie within our mask.  On other
+//! architectures it should be possible to use alignment bits, but we have not done this yet.
+//!
+//! The control block and counts used by `WeightedArc` are identical to the current implementation
+//! of `std::sync::Arc` to the extent that it should be possible to freely convert between the
+//! types with `Arc::from_raw(WeightedArc::into_raw(wa))` and vice versa.  This is of course
+//! wildly unsafe.
 
 #![feature(cfg_target_has_atomic)]
 #![cfg(all(target_pointer_width = "64", target_has_atomic = "64"))]
+#![cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #![feature(allocator_api)]
 #![feature(box_into_raw_non_null)]
 #![feature(extern_prelude)]
@@ -1204,7 +1228,7 @@ unsafe impl<T: Send + Sync> Sync for AtomicWeightedArc<T> {}
 /// Despite the differences between `WeightedWeak` and `WeightedArc`, the implementation of
 /// `AtomicOptionWeightedWeak` is only concerned with manipulating reference counts and is thus
 /// almost identical to `AtomicOptionWeightedArc`
-struct AtomicOptionWeightedWeak<T> {
+pub struct AtomicOptionWeightedWeak<T> {
     ptr: AtomicCountedPtr<ArcInner<T>>,
 }
 
