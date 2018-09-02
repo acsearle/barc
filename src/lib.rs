@@ -46,7 +46,8 @@
 //! The implementation inherently relies on architecture-specific details of how pointers are
 //! stored, and the library is not available on incompatible architectures.  We support
 //! x86_64 and AArch64, covering the majority of desktop and mobile devices (servers?).  In
-//! debug mode we also validate that all set bits of pointers lie within our mask.  On other
+//! debug mode we also validate incoming pointers before packing them, which will
+//! detect if we are trying to run on an incompatible system.  On other
 //! architectures it should be possible to use alignment bits, but we have not done this yet.
 //!
 //! The control block and counts used by `WeightedArc` are identical to the current implementation
@@ -398,6 +399,10 @@ struct ArcInner<T : ?Sized> {
 
 /// Drop-in replacement for [`std::sync::Arc`] compatible with lock-free atomics
 ///
+/// Except where noted, the documentation and guarantees of `Arc` are applicable.
+///
+/// # Implementation
+///
 /// (represented as 0 to N - 1).  An Arc and a WeightedArc with weight one have the same
 /// bit representation.  The weight is a measure of how much ownership object has, and it can be
 /// reallocated between objects without touching the global .strong count, enabling lock-free
@@ -410,6 +415,8 @@ pub struct WeightedArc<T> {
 
 /// Drop-in replacement for [`std::sync::Weak`] compatible with lock-free atomics
 ///
+/// # Implementation
+///
 /// WeightedWeak packs a weight into the spare bits of its pointer, the weight ranging from 1 to N
 /// (represented as 0 to N - 1).  A Weak and a WeightedWeak with weight one have the same
 /// bit representation.  The weight is a measure of how much weak ownership the object has
@@ -419,8 +426,18 @@ pub struct WeightedWeak<T> {
 
 impl<T> WeightedArc<T> {
 
-    /// Create a new WeightedArc managing the lifetime of a value on the heap
+    /// See [`std::sync::Arc::new`]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::WeightedArc;
+    ///
+    /// let a = WeightedArc::new(1);
+    /// ```
     pub fn new(data: T) -> Self {
+        // The weak count is offset by 1 (rather than N) to maintain binary compatibility with
+        // std:sync::Arc.
         Self {
             ptr: CountedNonNullPtr::new(
                 N,
@@ -437,9 +454,22 @@ impl<T> WeightedArc<T> {
         }
     }
 
-    /// Attempt to move the value from the heap.  This is only allowed if no other WeightedArc is
-    /// sharing it.  WeightedWeaks do not prevent unwrapping, though upgrading them will race with
-    /// it.
+    /// See [`std::sync::Arc::new`]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::WeightedArc;
+    ///
+    /// let a = WeightedArc::new(7);
+    /// {
+    ///     let b = a.clone();
+    ///     let c = WeightedArc::try_unwrap(b);
+    ///     assert!(c.is_err());
+    /// }
+    /// let d = WeightedArc::try_unwrap(a);
+    /// assert_eq!(d.unwrap(), 7);
+    /// ```
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
         let (n, p) = this.ptr.get();
         match this.ptr.strong.compare_exchange(n, 0, Release, Relaxed) {
@@ -456,9 +486,28 @@ impl<T> WeightedArc<T> {
         }
     }
 
-    /// Get a raw pointer to the object on the heap.  If this pointer is not eventually returned
-    /// to management via from_raw, the object will be leaked.  Useful for foreign functions?
-    /// If we have more than one weight, we return the excess to the global count first.
+    /// See [`std::sync::Arc::into_raw`]
+    ///
+    /// # Safety
+    ///
+    /// It is safe to call this function and dereference the pointer.  If the pointer is not
+    /// returned to management via [`WeightedArc::from_raw`] the object will be leaked.
+    ///
+    /// The returned pointer is into a private `barc::ArcInner<T>` structure that is layout and
+    /// usage compatible with the private `std::sync::ArcInner<T>`, so passing it to
+    /// [`std::sync::Arc::from_raw`] should work but is not recommended.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use barc::WeightedArc;
+    ///
+    /// let a = WeightedArc::new(7);
+    /// let p = WeightedArc::into_raw(a.clone());
+    /// let b = unsafe { WeightedArc::from_raw(p) };
+    /// assert!(WeightedArc::ptr_eq(&a, &b));
+    /// ```
+    ///
     pub fn into_raw(this: Self) -> *const T {
         let (n, _) = this.ptr.get();
         if n > 1 {
@@ -471,6 +520,20 @@ impl<T> WeightedArc<T> {
         ptr
     }
 
+    /// See [`std::sync::Arc::from_raw`].
+    ///
+    /// # Safety
+    ///
+    /// Unsafe.  The caller must ensure that the pointer originated from `WeightedArc::into_raw`.
+    ///
+    /// The pointer is expected to point into a private struct `barc::ArcInner` which is layout
+    /// and usage compatible with the private struct `std::sync::ArcInner`, so passing a pointer
+    /// from [`std::sync::Arc::into_raw`] should work but is not recommended.
+    ///
+    /// # Examples
+    ///
+    /// See [`WeightedArc::into_raw`].
+    ///
     pub unsafe fn from_raw(ptr: *const T) -> Self {
         let fake_ptr = 0 as *const ArcInner<T>;
         let offset = &(*fake_ptr).data as *const T as usize;
@@ -480,6 +543,21 @@ impl<T> WeightedArc<T> {
         }
     }
 
+    /// See [`std::sync::Arc::downgrade`]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::{WeightedArc, WeightedWeak};
+    ///
+    /// let a = WeightedArc::new(7);
+    /// let b = WeightedArc::downgrade(&a);
+    /// let c = WeightedWeak::upgrade(&b);
+    /// assert!(WeightedArc::ptr_eq(&a, &c.unwrap()));
+    /// drop(a);
+    /// let d = WeightedWeak::upgrade(&b);
+    /// assert_eq!(d, None);
+    /// ```
     pub fn downgrade(this: &Self) -> WeightedWeak<T> {
         let (_, p) = this.ptr.get();
         let mut cur = this.ptr.weak.load(Relaxed);
@@ -498,9 +576,89 @@ impl<T> WeightedArc<T> {
         }
     }
 
-    /// This is not a count, but an upper bound on the number of WeightedWeaks.  Returns zero if
-    /// and only if there were no WeightedWeaks at some time, but races against the downgrading
-    /// of any WeightedArcs.
+    /// Return the total strong ownership of all `WeightedArc`s for the managed object.
+    ///
+    /// # Compatibility
+    ///
+    /// The returned value will differ from that returned by `Arc::strong_count` for equivalent
+    /// code.  This is one of two observable incompatibilities with Arc.
+    ///
+    /// # Safety
+    ///
+    /// Though safe to call, the result is difficult to use safely, typically requiring some
+    /// additional synchronization or guarantees.
+    /// Prefer [`WeightedArc::try_unwrap`], [`WeightedArc::get_mut`] or [`WeightedArc::make_mut`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::WeightedArc;
+    ///
+    /// let a = WeightedArc::new(1);
+    /// let n = WeightedArc::strong_count(&a);
+    /// assert!(n > 0);
+    /// let b = a.clone();
+    /// let m = WeightedArc::strong_count(&a);
+    /// assert!(m > n);
+    /// ```
+    pub fn strong_count(this: &Self) -> usize {
+        this.ptr.strong.load(Relaxed)
+    }
+
+    /// Return the total weak ownership of all `WeightedWeak`s for the managed object
+    ///
+    /// # Compatibility
+    ///
+    /// The returned value will differ from that returned by `Arc::weak_count` for equivalent
+    /// code.  This is one of two observable incompatibilities with Arc.
+    ///
+    /// # Safety
+    ///
+    /// Though safe to call, the result is difficult to use safely, typically requiring some
+    /// additional synchronization or guarantees.
+    /// Prefer [`WeightedArc::try_unwrap`], [`WeightedArc::get_mut`] or [`WeightedArc::make_mut`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::WeightedArc;
+    ///
+    /// let a = WeightedArc::new(1);
+    /// let n = WeightedArc::weak_count(&a);
+    /// assert_eq!(n, 0);
+    /// let b = WeightedArc::downgrade(&a);
+    /// let m = WeightedArc::weak_count(&a);
+    /// assert!(m > 0);
+    /// ```
+    pub fn weak_count(this: &Self) -> usize {
+        let n = this.ptr.weak.load(Relaxed);
+        if n == std::usize::MAX {
+            0
+        } else {
+            n - 1
+        }
+    }
+
+    /// Provide an upper bound on the number of `WeightedWeak`s associated with the object.
+    ///
+    /// # Safety
+    ///
+    /// It is safe to call this function, but difficult to use the result without further
+    /// synchronization or guarantees.
+    /// Prefer [`WeightedArc::try_unwrap`], [`WeightedArc::get_mut`] or [`WeightedArc::make_mut`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use barc::WeightedArc;
+    ///
+    /// let a = WeightedArc::new(1);
+    /// let n = WeightedArc::weak_bound(&a);
+    /// assert_eq!(n, 0);
+    /// let b = WeightedArc::downgrade(&a);
+    /// let m = WeightedArc::weak_bound(&a);
+    /// assert!(m >= 1);
+    /// ```
     pub fn weak_bound(this: &Self) -> usize {
         // I don't understand why this load is SeqCst in std::sync::Arc.  I believe that SeqCst
         // synchronizes only with itself, not Acqure/Release?
@@ -515,9 +673,26 @@ impl<T> WeightedArc<T> {
         }
     }
 
-    /// This is not a count, but an upper bound on the number of WeightedArcs.  Since it is invoked
-    /// on a WeightedArc, a lower bound is 1.  Returns if and only if the WeightedArc was unique
-    /// at some time, but races against the upgrading of any WeightedWeaks
+    /// Provide an upper bound on the number of `WeightedArc`s associated with the object.
+    ///
+    /// # Safety
+    ///
+    /// It is safe to call this function, but difficult to use the result without further
+    /// synchronization or guarantees.
+    /// Prefer [`WeightedArc::try_unwrap`], [`WeightedArc::get_mut`] or [`WeightedArc::make_mut`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use barc::WeightedArc;
+    ///
+    /// let a = WeightedArc::new(1);
+    /// let n = WeightedArc::strong_bound(&a);
+    /// assert_eq!(n, 1);
+    /// let b = a.clone();
+    /// let m = WeightedArc::strong_bound(&a);
+    /// assert!(m >= 2);
+    /// ```
     pub fn strong_bound(this: &Self) -> usize {
         let (n, _) = this.ptr.get();
         // I don't understand why this load is SeqCst in std::sync::Arc.  I beleive that SeqCst
@@ -570,20 +745,42 @@ impl<T> WeightedArc<T> {
     ///
     /// # Safety
     ///
-    /// None
+    /// Misuse will cause a data race.
     ///
     /// # Panics
     ///
-    /// Only in debug mode, panics if the `WeightedArc` is not unique.
+    /// Only in debug mode, panics if the `WeightedArc` is not truly unique.
     ///
+    /// # Example
+    ///
+    /// ```
+    /// use barc::WeightedArc;
+    ///
+    /// let mut a = WeightedArc::new(1);
+    /// unsafe { *WeightedArc::get_mut_unchecked(&mut a) += 1 };
+    /// assert_eq!(*a, 2);
+    /// ```
     pub unsafe fn get_mut_unchecked(this: &mut Self) -> &mut T {
         debug_assert!(this.is_unique());
         &mut this.ptr.data
     }
 
-    /// Clone, but allowed to mutate self in a way that does not change its equivalence class
-    /// so that the postcondition still holds.  For WeightedArc, we can usually avoid touching
-    /// the global strong count by stealing some weight from self.
+    /// Clone a `&mut WeightedArc` without touching the reference count, by taking some of
+    /// `self`'s local weight.
+    /// This changes the representation of self, but not its equivalence class under `Eq` or
+    /// `WeightedArc::ptr_eq`.
+    /// As `WeightedArc` is `Sync` we cannot use this implementation for `clone`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::WeightedArc;
+    ///
+    /// let mut a = WeightedArc::new(2);
+    /// let b = a.clone_mut();
+    /// assert!(WeightedArc::ptr_eq(&a, &b));
+    /// ```
+    ///
     pub fn clone_mut(&mut self) -> Self {
         let (n, p) = self.ptr.get();
         if n == 1 {
@@ -605,6 +802,17 @@ impl<T> WeightedArc<T> {
         }
     }
 
+    /// Split one `WeightedArc` into two, without touching the reference count if possible
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::WeightedArc;
+    ///
+    /// let (a, b) = WeightedArc::split(WeightedArc::new(2));
+    /// assert!(WeightedArc::ptr_eq(&a, &b));
+    /// ```
+    ///
     pub fn split(this: Self) -> (Self, Self) {
         let (mut n, p) = this.ptr.get();
         std::mem::forget(this);
@@ -623,6 +831,21 @@ impl<T> WeightedArc<T> {
         )
     }
 
+    /// Merge two `WeightedArc`s into one, without touching the reference count if possible.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the arguments are not `WeghtedArc::ptr_eq`
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::WeightedArc;
+    ///
+    /// let a = WeightedArc::new(2);
+    /// let (b, c) = WeightedArc::split(a);
+    /// let d = WeightedArc::merge(b, c);
+    /// ```
     pub fn merge(left: Self, right: Self) -> Self {
         assert!(WeightedArc::ptr_eq(&left, &right));
         let (n, p) = left.ptr.get();
@@ -639,7 +862,7 @@ impl<T> WeightedArc<T> {
         }
     }
 
-    pub fn fortify(&mut self) {
+    fn fortify(&mut self) {
         let (n, _) = self.ptr.get();
         if n < N {
             self.ptr.strong.fetch_add(N - n, Relaxed);
@@ -1153,32 +1376,116 @@ pub struct AtomicWeightedArc<T> {
 
 impl<T> AtomicWeightedArc<T> {
 
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::{WeightedArc, AtomicWeightedArc};
+    ///
+    /// let a = WeightedArc::new(7);
+    /// let b = AtomicWeightedArc::new(a);
+    /// ```
+    ///
     pub fn new(val: WeightedArc<T>) -> Self {
         Self { value: AtomicOptionWeightedArc::new(Some(val)) }
     }
 
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::{WeightedArc, AtomicWeightedArc};
+    ///
+    /// let a = WeightedArc::new(7);
+    /// let b = AtomicWeightedArc::new(a.clone());
+    /// let c = b.into_inner();
+    /// assert!(WeightedArc::ptr_eq(&a, &c));
+    /// ```
+    ///
     pub fn into_inner(self) -> WeightedArc<T> {
         self.value.into_inner().unwrap()
     }
 
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::{WeightedArc, AtomicWeightedArc};
+    ///
+    /// let a = WeightedArc::new(7);
+    /// let mut b = AtomicWeightedArc::new(a.clone());
+    /// let c = WeightedArc::new(8);
+    /// *b.get_mut() = c.clone();
+    /// let d = b.into_inner();
+    /// assert!(WeightedArc::ptr_eq(&c, &d));
+    /// ```
+    ///
     pub fn get_mut(&mut self) -> &mut WeightedArc<T> {
         // Rely on layout compatibility
         unsafe { &mut *(self.value.get_mut() as *mut Option<WeightedArc<T>> as *mut WeightedArc<T>) }
     }
 
-    /// See [`AtomicOptionWeightedArc`] for details
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::{WeightedArc, AtomicWeightedArc};
+    ///
+    /// let a = WeightedArc::new(7);
+    /// let b = AtomicWeightedArc::new(a.clone());
+    /// let c = b.load();
+    /// assert!(WeightedArc::ptr_eq(&a, &c));
+    /// ```
+    ///
     pub fn load(&self) -> WeightedArc<T> {
         self.value.load().unwrap()
     }
 
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::{WeightedArc, AtomicWeightedArc};
+    ///
+    /// let a = WeightedArc::new(7);
+    /// let b = AtomicWeightedArc::new(a.clone());
+    /// let c = WeightedArc::new(8);
+    /// b.store(c.clone());
+    /// let d = b.load();
+    /// assert!(WeightedArc::ptr_eq(&c, &d));
+    /// ```
+    ///
     pub fn store(&self, new: WeightedArc<T>) {
         self.value.store(Some(new))
     }
 
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::{WeightedArc, AtomicWeightedArc};
+    ///
+    /// let a = WeightedArc::new(7);
+    /// let b = AtomicWeightedArc::new(a.clone());
+    /// let c = WeightedArc::new(8);
+    /// let d = b.swap(c.clone());
+    /// assert!(WeightedArc::ptr_eq(&a, &d));
+    /// ```
+    ///
     pub fn swap(&self, new: WeightedArc<T>) -> WeightedArc<T> {
         self.value.swap(Some(new)).unwrap()
     }
 
+    /// See [`AtomicOptionWeightedArc::compare_exchange`] for details
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::{WeightedArc, AtomicWeightedArc};
+    ///
+    /// let a = WeightedArc::new(7);
+    /// let b = AtomicWeightedArc::new(a.clone());
+    /// let c = WeightedArc::new(8);
+    /// let mut d = b.compare_and_swap(a.clone(), c.clone());
+    /// assert!(WeightedArc::ptr_eq(&a, &d)); // Swap succeeded
+    /// d = b.compare_and_swap(a.clone(), c.clone());
+    /// assert!(WeightedArc::ptr_eq(&c, &d)); // Swap failed
+    /// ```
+    ///
     pub fn compare_and_swap(
         &self,
         current: WeightedArc<T>,
@@ -1187,7 +1494,22 @@ impl<T> AtomicWeightedArc<T> {
         self.value.compare_and_swap(Some(current), Some(new)).unwrap()
     }
 
-    /// See [`AtomicOptionWeightedArc`] for details
+    /// See [`AtomicOptionWeightedArc::compare_exchange`] for details
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::{WeightedArc, AtomicWeightedArc};
+    ///
+    /// let a = WeightedArc::new(7);
+    /// let b = AtomicWeightedArc::new(a.clone());
+    /// let c = WeightedArc::new(8);
+    /// let mut d = b.compare_exchange(a.clone(), c.clone());
+    /// assert_eq!(d, Ok(a.clone()));
+    /// d = b.compare_exchange(a.clone(), c.clone());
+    /// assert_eq!(d, Err(c.clone()));
+    /// ```
+    ///
     pub fn compare_exchange(
         &self,
         current: WeightedArc<T>,
@@ -1199,8 +1521,33 @@ impl<T> AtomicWeightedArc<T> {
         }
     }
 
-    /// The current implementation calls ['compare_exchange`] as there is no particular benefit
-    /// to allowing spurious failure
+    /// See [`AtomicOptionWeightedArc::compare_exchange_weak`] for details
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::{WeightedArc, AtomicWeightedArc};
+    ///
+    /// let a = WeightedArc::new(7);
+    /// let b = AtomicWeightedArc::new(a.clone());
+    /// let c = WeightedArc::new(8);
+    /// loop {
+    ///     match b.compare_exchange_weak(a.clone(), c.clone()) {
+    ///         Ok(old) => {
+    ///             assert!(WeightedArc::ptr_eq(&a, &old));
+    ///             break
+    ///         },
+    ///         Err(actual) => {
+    ///             // Spurious failure must return the actual state
+    ///             assert!(WeightedArc::ptr_eq(&a, &actual));
+    ///             continue
+    ///         }
+    ///     }
+    /// }
+    /// let d = b.compare_exchange(a.clone(), c.clone());
+    /// assert_eq!(d, Err(c.clone()));
+    /// ```
+    ///
     pub fn compare_exchange_weak(
         &self,
         current: WeightedArc<T>,
@@ -1485,102 +1832,135 @@ impl<T> AtomicWeightedWeak<T> {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicIsize;
+    use std::sync::Arc; // Until we become "self-hosting"
 
-    #[derive(Debug, PartialEq, Eq)]
-    struct Canary {
-        value: usize,
+    /// The service provided by Arc is to drop its contents at the appropriate time,
+    /// so a key failure mode is not running drop at the end of scope.
+    /// We can't test this with an assert_eq.
+    ///
+    /// We create a special Canary type for testing.  For the test scope, one Cage hatches
+    /// Canaries.  Each new or cloned Canary increments a counter shared with the Cage.  Each
+    /// dropped Canary decrements the counter.  When the Cage is dropped it asserts that no
+    /// Canaries are alive.  The analogy is becoming strained.
+    ///
+    /// The test system should be thread-safe but requires the use of scoped threads.
+
+    struct Cage {
+        counter: Arc<AtomicIsize>,
     }
 
-    /// make it thread-local?
+    impl Cage {
 
-    static CANARY_COUNT: AtomicIsize = AtomicIsize::new(0);
+        fn new() -> Self {
+            Self { counter: Arc::new(AtomicIsize::new(0)) }
+        }
+
+        fn hatch(&self, x: isize) -> Canary {
+            assert!(self.counter.fetch_add(1, Relaxed) >= 0);
+            Canary { counter: self.counter.clone(), value: x }
+        }
+
+        fn check(&self) {
+            assert_eq!(self.counter.load(Relaxed), 0);
+        }
+
+    }
+
+    impl Drop for Cage {
+        fn drop(&mut self) {
+            assert_eq!(self.counter.load(Relaxed), 0);
+        }
+    }
+
+    #[derive(Debug)]
+    struct Canary {
+        counter: Arc<AtomicIsize>,
+        value: isize,
+    }
 
     impl Canary {
-        fn new(x: usize) -> Self {
-            let n = CANARY_COUNT.fetch_add(1, AcqRel);
-            assert!(n >= 0);
-            println!("Creating with value {:?}", x);
-            Canary { value: x }
-        }
-        fn check() {
-            assert_eq!(CANARY_COUNT.load(Acquire), 0);
-        }
     }
 
     impl Clone for Canary {
         fn clone(&self) -> Self {
-            Canary::new(self.value)
+            self.counter.fetch_add(1, Relaxed);
+            Canary { counter: self.counter.clone(), value: self.value }
         }
     }
 
     impl Drop for Canary {
         fn drop(&mut self) {
-            println!("Dropping with value {:?}", self.value);
-            let n = CANARY_COUNT.fetch_sub(1, AcqRel);
-            assert!(n > 0);
+            assert!(self.counter.fetch_sub(1, Relaxed) > 0);
         }
     }
 
-    //#[test]
+    impl PartialEq for Canary {
+        fn eq(&self, other: &Self) -> bool {
+            assert!(Arc::ptr_eq(&self.counter, &other.counter));
+            return &self.value == &other.value;
+        }
+    }
+
+    impl Eq for Canary {
+
+    }
+
+    #[test]
     fn test_new() {
-        CANARY_COUNT.store(0, Release);
-        Canary::check();
         {
+            let cage = Cage::new();
             assert!(std::mem::size_of::<Option<WeightedArc<Canary>>>() == 8);
         }
-        Canary::check();
         {
-            let a = WeightedArc::new(Canary::new(0));
-            assert_eq!(*a, Canary::new(0));
+            let cage = Cage::new();
+            let a = WeightedArc::new(cage.hatch(0));
+            assert_eq!(*a, cage.hatch(0));
         }
-        Canary::check();
         {
-            let a = WeightedArc::new(Canary::new(4));
+            let cage = Cage::new();
+            let a = WeightedArc::new(cage.hatch(4));
             assert!(WeightedArc::ptr_eq(&a, &a));
-            let b = WeightedArc::new(Canary::new(5));
+            let b = WeightedArc::new(cage.hatch(5));
             assert!(!WeightedArc::ptr_eq(&a, &b));
         }
-        Canary::check();
         {
-            let a = WeightedArc::new(Canary::new(3));
+            let cage = Cage::new();
+            let a = WeightedArc::new(cage.hatch(3));
             let b = a.clone();
             assert_eq!(a, b);
             assert!(WeightedArc::ptr_eq(&a, &b));
         }
-        Canary::check();
         {
-            {
-                let a = WeightedArc::new(Canary::new(1));
-                assert_eq!(WeightedArc::try_unwrap(a), Ok(Canary::new(1)));
-            }
-            Canary::check();
-            {
-                let a = WeightedArc::new(Canary::new(2));
-                let b = a.clone();
-                println!("{:?}", a);
-                assert_eq!(WeightedArc::try_unwrap(a), Err(b));
-            }
+            let cage = Cage::new();
+            let a = WeightedArc::new(cage.hatch(1));
+            assert_eq!(WeightedArc::try_unwrap(a), Ok(cage.hatch(1)));
         }
-        Canary::check();
         {
-            let a = WeightedArc::new(Canary::new(1));
+            let cage = Cage::new();
+            let a = WeightedArc::new(cage.hatch(2));
+            let b = a.clone();
+            assert_eq!(WeightedArc::try_unwrap(a), Err(b));
+        }
+        {
+            let cage = Cage::new();
+            let a = WeightedArc::new(cage.hatch(1));
             let b = a.clone();
             assert!(WeightedArc::ptr_eq(&a, &b));
             let c = WeightedArc::into_raw(a);
             let d = unsafe { WeightedArc::from_raw(c) };
             assert!(WeightedArc::ptr_eq(&d, &b));
         }
-        Canary::check();
         {
-            let a = WeightedArc::new(Canary::new(1));
+            let cage = Cage::new();
+            let a = WeightedArc::new(cage.hatch(1));
             let b = WeightedArc::downgrade(&a);
             assert_eq!(WeightedWeak::upgrade(&b), Some(a));
             // a is dropped here
             assert_eq!(WeightedWeak::upgrade(&b), None);
         }
-        Canary::check();
         {
-            let a = WeightedArc::new(Canary::new(1));
+            let cage = Cage::new();
+            let a = WeightedArc::new(cage.hatch(1));
             assert_eq!(WeightedArc::strong_bound(&a), 1);
             assert_eq!(WeightedArc::weak_bound(&a), 0);
             let b = a.clone();
@@ -1588,90 +1968,87 @@ mod tests {
             let c = WeightedArc::downgrade(&a);
             assert!(WeightedArc::weak_bound(&a) > 0);
         }
-        Canary::check();
         {
-            let mut a = WeightedArc::new(Canary::new(1));
-            assert_eq!(*a, Canary::new(1));
-            *WeightedArc::make_mut(&mut a) = Canary::new(2);
-            assert_eq!(*a, Canary::new(2));
+            let cage = Cage::new();
+            let mut a = WeightedArc::new(cage.hatch(1));
+            assert_eq!(*a, cage.hatch(1));
+            *WeightedArc::make_mut(&mut a) = cage.hatch(2);
+            assert_eq!(*a, cage.hatch(2));
             let b = a.clone();
-            *WeightedArc::make_mut(&mut a) = Canary::new(3);
-            assert_eq!(*a, Canary::new(3));
-            assert_eq!(*b, Canary::new(2));
+            *WeightedArc::make_mut(&mut a) = cage.hatch(3);
+            assert_eq!(*a, cage.hatch(3));
+            assert_eq!(*b, cage.hatch(2));
         }
-        Canary::check();
         {
-            let mut a = WeightedArc::new(Canary::new(1));
-            assert_eq!(*a, Canary::new(1));
-            *WeightedArc::get_mut(&mut a).unwrap() = Canary::new(2);
-            assert_eq!(*a, Canary::new(2));
+            let cage = Cage::new();
+            let mut a = WeightedArc::new(cage.hatch(1));
+            assert_eq!(*a, cage.hatch(1));
+            *WeightedArc::get_mut(&mut a).unwrap() = cage.hatch(2);
+            assert_eq!(*a, cage.hatch(2));
             let mut b = a.clone();
             assert_eq!(WeightedArc::get_mut(&mut a), None);
         }
-        Canary::check();
         {
-            let a = WeightedArc::new(Canary::new(1));
-            let b = WeightedArc::new(Canary::new(1));
+            let cage = Cage::new();
+            let a = WeightedArc::new(cage.hatch(1));
+            let b = WeightedArc::new(cage.hatch(1));
             assert_eq!(a, b);
             assert!(!WeightedArc::ptr_eq(&a, &b));
         }
-        Canary::check();
     }
 
     #[test]
     fn test_atomic() {
-        CANARY_COUNT.store(0, Release);
-        Canary::check();
         {
-            let a = AtomicOptionWeightedArc::new(Some(WeightedArc::new(Canary::new(99))));
+            let cage = Cage::new();
+            let a = AtomicOptionWeightedArc::new(Some(WeightedArc::new(cage.hatch(99))));
         }
-        Canary::check();
         {
-            let a = AtomicOptionWeightedArc::new(Some(WeightedArc::new(Canary::new(1))));
+            let cage = Cage::new();
+            let a = AtomicOptionWeightedArc::new(Some(WeightedArc::new(cage.hatch(1))));
             assert_eq!(a.load().unwrap().value, 1);
             //let b : AtomicOptionWeightedArc<usize> = AtomicOptionWeightedArc::new(None);
             //assert_eq!(b.load(), None);
         }
-        Canary::check();
         {
-            let a = AtomicOptionWeightedArc::new(Some(WeightedArc::new(Canary::new(1))));
-            assert_eq!(a.into_inner(), Some(WeightedArc::new(Canary::new(1))));
+            let cage = Cage::new();
+            let a = AtomicOptionWeightedArc::new(Some(WeightedArc::new(cage.hatch(1))));
+            assert_eq!(a.into_inner(), Some(WeightedArc::new(cage.hatch(1))));
         }
-        Canary::check();
         {
-            let a = WeightedArc::new(Canary::new(1));
+            let cage = Cage::new();
+            let a = WeightedArc::new(cage.hatch(1));
             let b = AtomicOptionWeightedArc::new(Some(a.clone()));
             let c = b.load();
             assert_eq!(&a, &c.unwrap());
         }
-        Canary::check();
         {
-            let a = WeightedArc::new(Canary::new(1));
-            let b = WeightedArc::new(Canary::new(2));
+            let cage = Cage::new();
+            let a = WeightedArc::new(cage.hatch(1));
+            let b = WeightedArc::new(cage.hatch(2));
             let c = AtomicOptionWeightedArc::new(Some(a));
             c.store(Some(b));
-            assert_eq!(*c.load().unwrap(), Canary::new(2));
+            assert_eq!(*c.load().unwrap(), cage.hatch(2));
         }
-        Canary::check();
         {
-            let a = WeightedArc::new(Canary::new(1));
-            let b = WeightedArc::new(Canary::new(2));
+            let cage = Cage::new();
+            let a = WeightedArc::new(cage.hatch(1));
+            let b = WeightedArc::new(cage.hatch(2));
             let c = AtomicOptionWeightedArc::new(Some(a));
             let d = c.swap(Some(b));
-            assert_eq!(*d.unwrap(), Canary::new(1));
+            assert_eq!(*d.unwrap(), cage.hatch(1));
             let e = c.load();
-            assert_eq!(*e.unwrap(), Canary::new(2));
+            assert_eq!(*e.unwrap(), cage.hatch(2));
         }
-        Canary::check();
         {
-            let a = WeightedArc::new(Canary::new(1));
-            let b = WeightedArc::new(Canary::new(2));
+            let cage = Cage::new();
+            let a = WeightedArc::new(cage.hatch(1));
+            let b = WeightedArc::new(cage.hatch(2));
             let c = AtomicOptionWeightedArc::new(Some(a.clone()));
             let d = c.compare_and_swap(Some(a.clone()), Some(b.clone()));
             assert!(WeightedArc::ptr_eq(&d.unwrap(), &a));
             let e = c.compare_and_swap(Some(a.clone()), Some(b.clone()));
             assert!(WeightedArc::ptr_eq(&e.unwrap(), &b));
         }
-        Canary::check();
     }
 }
