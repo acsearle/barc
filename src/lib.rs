@@ -75,7 +75,7 @@ use std::option::Option;
 
 use std::alloc::Alloc;
 
-use std::ops::{Deref, DerefMut};
+use std::ops::{Add, Sub, Deref, DerefMut};
 use std::clone::Clone;
 use std::fmt::Debug;
 use std::cmp::{PartialEq, Eq, PartialOrd, Ord};
@@ -111,15 +111,29 @@ const N : usize = 1 << 16;
 /// The payoff is that the representation of a pointer and a count of 1 is bitwise identical to
 /// just the pointer,
 /// and bitwise identical to the corresponding `std::sync::Arc`.
-struct CountedPtr<T> {
+// #[derive(Copy, Clone)] doesn't work
+#[derive(Debug, Eq, PartialEq)]
+pub struct CountedPtr<T> {
     ptr: usize,
     phantom: PhantomData<*mut T>,
 }
 
 impl<T> CountedPtr<T> {
 
-    // 1 <= count <= N
-    fn new(count: usize, pointer: *mut T) -> Self {
+    ///
+    /// # Examples:
+    ///
+    /// ```
+    /// use barc::*;
+    ///
+    /// let mut a = 1usize;
+    /// let b = CountedPtr::new(2, &mut a as *mut usize);
+    /// let (n, c) = b.get();
+    /// assert_eq!(n, 2);
+    /// assert_eq!(c, &mut a as *mut usize);
+    /// ```
+    ///
+    pub fn new(count: usize, pointer: *mut T) -> Self {
         debug_assert!(0 < count);
         debug_assert!(count <= N);
         debug_assert!(pointer as usize & !MASK == 0);
@@ -129,44 +143,53 @@ impl<T> CountedPtr<T> {
         }
     }
 
-    fn get(&self) -> (usize, *mut T) {
+    pub fn get(&self) -> (usize, *mut T) {
         (self.get_count(), self.get_ptr())
     }
 
-    fn get_count(&self) -> usize {
+    pub fn get_count(&self) -> usize {
         (self.ptr >> SHIFT) + 1
     }
 
-    fn get_ptr(&self) -> *mut T {
+    pub fn get_ptr(&self) -> *mut T {
         (self.ptr & MASK) as *mut T
     }
 
-    fn set(&mut self, count: usize, pointer: *mut T) {
+    pub fn set(&mut self, count: usize, pointer: *mut T) {
         *self = Self::new(count, pointer);
     }
 
-    fn set_count(&mut self, count: usize) {
+    pub fn set_count(&mut self, count: usize) {
         let (_, p) = self.get();
         *self = Self::new(count, p);
     }
 
-    fn set_ptr(&mut self, pointer: *mut T) {
+    pub fn set_ptr(&mut self, pointer: *mut T) {
         let (n, _) = self.get();
         *self = Self::new(n, pointer);
     }
 
-    fn ptr_eq(left: Self, right: Self) -> bool {
+    pub fn ptr_eq(left: Self, right: Self) -> bool {
         let (_n, p) = left.get();
         let (_m, q) = right.get();
         p == q
     }
 
-    fn is_null(&self) -> bool {
+    pub fn is_null(&self) -> bool {
         (self.ptr & MASK) != 0
+    }
+
+    pub unsafe fn as_ref(&self) -> &T {
+        &*self.get_ptr()
+    }
+
+    pub unsafe fn as_mut(&mut self) -> &mut T {
+        &mut *self.get_ptr()
     }
 
 }
 
+/// Derive Copy doesn't work for some reason
 impl<T> Clone for CountedPtr<T> {
     fn clone(&self) -> Self {
         Self {
@@ -176,24 +199,11 @@ impl<T> Clone for CountedPtr<T> {
     }
 }
 
+/// Derive Copy doesn't work for some reason
 impl<T> Copy for CountedPtr<T> {}
 
-impl<T> Deref for CountedPtr<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        let (_, p) = self.get();
-        unsafe { &*p }
-    }
-}
-
-impl<T> DerefMut for CountedPtr<T> {
-    fn deref_mut(&mut self) ->&mut T {
-        let (_, p) = self.get();
-        unsafe { &mut *p }
-    }
-}
-
-impl<T> std::ops::Sub<usize> for CountedPtr<T> {
+/// Manipulate the count (not the pointer)
+impl<T> Sub<usize> for CountedPtr<T> {
     type Output = Self;
 
     fn sub(self, rhs: usize) -> Self::Output {
@@ -203,7 +213,8 @@ impl<T> std::ops::Sub<usize> for CountedPtr<T> {
     }
 }
 
-impl<T> std::ops::Add<usize> for CountedPtr<T> {
+/// Manipulate the count (not the pointer)
+impl<T> Add<usize> for CountedPtr<T> {
     type Output = Self;
 
     fn add(self, rhs: usize) -> Self::Output {
@@ -212,6 +223,9 @@ impl<T> std::ops::Add<usize> for CountedPtr<T> {
         Self::new(n + rhs, p)
     }
 }
+
+unsafe impl<T> Send for CountedPtr<T> {}
+unsafe impl<T> Sync for CountedPtr<T> {}
 
 
 
@@ -223,12 +237,15 @@ impl<T> std::ops::Add<usize> for CountedPtr<T> {
 /// The use of a `NonZeroUsize` field lets `Option` recognize that it can use `0usize` to
 /// represent `None`, ultimately allowing `Option<WeightedArc<T>>` to have the same representation as
 /// the corresponding `CountedPtr<ArcInner<T>>`.
-struct CountedNonNullPtr<T> {
+///
+/// #[derive(Copy, CLone)] does not work for some reason?
+#[derive(Debug, Eq, PartialEq)]
+struct CountedNonNull<T> {
     ptr: NonZeroUsize,
     phantom: PhantomData<NonNull<T>>,
 }
 
-impl<T> CountedNonNullPtr<T> {
+impl<T> CountedNonNull<T> {
 
     fn new(count: usize, pointer: NonNull<T>) -> Self {
         debug_assert!(0 < count);
@@ -257,9 +274,29 @@ impl<T> CountedNonNullPtr<T> {
         *self = Self::new(count, p);
     }
 
+    fn get_ptr(&self) -> *mut T {
+        let (_, p) = self.get();
+        p.as_ptr()
+    }
+
+    fn set_ptr(&mut self, pointer: NonNull<T>) {
+        let (count, _) = self.get();
+        *self = Self::new(count, pointer);
+    }
+
+    pub unsafe fn as_ref(&self) -> &T {
+        let (_, p) = self.get();
+        &*p.as_ptr()
+    }
+
+    pub unsafe fn as_mut(&mut self) -> &mut T {
+        let (_, p) = self.get();
+        &mut *p.as_ptr()
+    }
+
 }
 
-impl<T> Clone for CountedNonNullPtr<T> {
+impl<T> Clone for CountedNonNull<T> {
     fn clone(&self) -> Self {
         Self {
             ptr: self.ptr,
@@ -268,25 +305,16 @@ impl<T> Clone for CountedNonNullPtr<T> {
     }
 }
 
-impl<T> Copy for CountedNonNullPtr<T> {}
+impl<T> Copy for CountedNonNull<T> {}
 
-impl<T> Deref for CountedNonNullPtr<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        let (_, p) = self.get();
-        unsafe { &*p.as_ptr() }
-    }
-}
-
-impl<T> DerefMut for CountedNonNullPtr<T> {
-    fn deref_mut(&mut self) ->&mut T {
-        let (_, p) = self.get();
-        unsafe { &mut *p.as_ptr() }
-    }
-}
+unsafe impl<T> Send for CountedNonNull<T> {}
+unsafe impl<T> Sync for CountedNonNull<T> {}
 
 
-struct AtomicCountedPtr<T> {
+/// AtomicCountedPtr
+///
+///
+pub struct AtomicCountedPtr<T> {
     ptr: AtomicUsize,
     phantom: PhantomData<CountedPtr<T>>
 }
@@ -304,35 +332,128 @@ impl<T> AtomicCountedPtr<T> {
         }
     }
 
-    fn new(p: CountedPtr<T>) -> Self {
+    /// Creates a new [`AtomicCountedPtr`]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::*;
+    /// use std::sync::atomic::Ordering::Relaxed;
+    ///
+    /// let mut a = 1usize;
+    /// let b = CountedPtr::new(2, &mut a);
+    /// let c = AtomicCountedPtr::new(b.clone());
+    /// assert_eq!(b, c.load(Relaxed));
+    /// ```
+    ///
+    pub fn new(p: CountedPtr<T>) -> Self {
         Self {
             ptr: AtomicUsize::new(Self::to_usize(p)),
             phantom: PhantomData,
         }
     }
 
-    fn into_inner(self) -> CountedPtr<T> {
+    /// Consumes an [`AtomicCountedPtr`] returning a [`CountedPtr`]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::*;
+    ///
+    /// let mut a = 1usize;
+    /// let b = CountedPtr::new(2, &mut a);
+    /// let c = AtomicCountedPtr::new(b);
+    /// assert_eq!(b, c.into_inner());
+    /// ```
+    ///
+    pub fn into_inner(self) -> CountedPtr<T> {
         Self::from_usize(self.ptr.into_inner())
     }
 
-    fn get_mut(&mut self) -> &mut CountedPtr<T> {
+    /// Get a mutable reference into an unshared [`AtomicCountedPtr`].  This is not atomic since
+    /// the instance is not shared.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::*;
+    /// use std::sync::atomic::Ordering::Relaxed;
+    ///
+    /// let mut a = 1usize;
+    /// let b = CountedPtr::new(2, &mut a);
+    /// let mut c = AtomicCountedPtr::new(b);
+    /// let mut d = 2usize;
+    /// let e = CountedPtr::new(3, &mut d);
+    /// *c.get_mut() = e;
+    /// assert_eq!(e, c.load(Relaxed));
+    /// ```
+    ///
+    pub fn get_mut(&mut self) -> &mut CountedPtr<T> {
         // Relies on layout
         unsafe { &mut *(self.ptr.get_mut() as *mut usize as *mut CountedPtr<T>) }
     }
 
-    fn load(&self, order: Ordering) -> CountedPtr<T> {
+    /// Atomically load a `CountedPtr`
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::*;
+    /// use std::sync::atomic::Ordering::Relaxed;
+    ///
+    /// let mut a = 1usize;
+    /// let b = CountedPtr::new(2, &mut a);
+    /// let c = AtomicCountedPtr::new(b);
+    /// assert_eq!(b, c.load(Relaxed));
+    /// ```
+    ///
+    pub fn load(&self, order: Ordering) -> CountedPtr<T> {
         Self::from_usize(self.ptr.load(order))
     }
 
-    fn store(&self, p: CountedPtr<T>, order: Ordering) {
+    /// Atomically store a `CountedPtr`
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::*;
+    /// use std::sync::atomic::Ordering::Relaxed;
+    ///
+    /// let mut a = 1usize;
+    /// let b = CountedPtr::new(2, &mut a);
+    /// let c = AtomicCountedPtr::new(b);
+    /// let mut d = 2usize;
+    /// let e = CountedPtr::new(3, &mut d);
+    /// c.store(e, Relaxed);
+    /// assert_eq!(e, c.load(Relaxed));
+    /// ```
+    ///
+    pub fn store(&self, p: CountedPtr<T>, order: Ordering) {
         self.ptr.store(Self::to_usize(p), order)
     }
 
-    fn swap(&self, p: CountedPtr<T>, order: Ordering) -> CountedPtr<T> {
+    /// Atomically swap a `CountedPtr`
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use barc::*;
+    /// use std::sync::atomic::Ordering::Relaxed;
+    ///
+    /// let mut a = 1usize;
+    /// let b = CountedPtr::new(2, &mut a);
+    /// let c = AtomicCountedPtr::new(b);
+    /// let mut d = 2usize;
+    /// let e = CountedPtr::new(3, &mut d);
+    /// assert_eq!(b, c.swap(e, Relaxed));
+    /// assert_eq!(e, c.load(Relaxed));
+    /// ```
+    ///
+    pub fn swap(&self, p: CountedPtr<T>, order: Ordering) -> CountedPtr<T> {
         Self::from_usize(self.ptr.swap(Self::to_usize(p), order))
     }
 
-    fn compare_and_swap(
+    pub fn compare_and_swap(
         &self,
         current: CountedPtr<T>,
         new: CountedPtr<T>,
@@ -347,7 +468,7 @@ impl<T> AtomicCountedPtr<T> {
         )
     }
 
-    fn compare_exchange(
+    pub fn compare_exchange(
         &self,
         current: CountedPtr<T>,
         new: CountedPtr<T>,
@@ -365,7 +486,7 @@ impl<T> AtomicCountedPtr<T> {
         }
     }
 
-    fn compare_exchange_weak(
+    pub fn compare_exchange_weak(
         &self,
         current: CountedPtr<T>,
         new: CountedPtr<T>,
@@ -385,6 +506,14 @@ impl<T> AtomicCountedPtr<T> {
 
 }
 
+unsafe impl<T> Send for AtomicCountedPtr<T> {}
+unsafe impl<T> Sync for AtomicCountedPtr<T> {}
+
+
+
+///
+///
+///
 struct ArcInner<T : ?Sized> {
     strong : AtomicUsize,
     weak : AtomicUsize,
@@ -404,7 +533,7 @@ struct ArcInner<T : ?Sized> {
 /// split and merge, which sometimes enable us to clone and drop without touching the the global
 /// reference count
 pub struct WeightedArc<T> {
-    ptr: CountedNonNullPtr<ArcInner<T>>
+    ptr: CountedNonNull<ArcInner<T>>
 }
 
 /// Drop-in replacement for [`std::sync::Weak`] compatible with lock-free atomics
@@ -415,10 +544,14 @@ pub struct WeightedArc<T> {
 /// (represented as 0 to N - 1).  A Weak and a WeightedWeak with weight one have the same
 /// bit representation.  The weight is a measure of how much weak ownership the object has
 pub struct WeightedWeak<T> {
-    ptr : CountedNonNullPtr<ArcInner<T>>
+    ptr : CountedNonNull<ArcInner<T>>
 }
 
 impl<T> WeightedArc<T> {
+
+    fn inner(&self) -> &ArcInner<T> {
+        unsafe { self.ptr.as_ref() }
+    }
 
     /// See [`std::sync::Arc::new`]
     ///
@@ -433,7 +566,7 @@ impl<T> WeightedArc<T> {
         // The weak count is offset by 1 (rather than N) to maintain binary compatibility with
         // std:sync::Arc.
         Self {
-            ptr: CountedNonNullPtr::new(
+            ptr: CountedNonNull::new(
                 N,
                 Box::into_raw_non_null(
                     Box::new(
@@ -466,12 +599,12 @@ impl<T> WeightedArc<T> {
     /// ```
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
         let (n, p) = this.ptr.get();
-        match this.ptr.strong.compare_exchange(n, 0, Release, Relaxed) {
+        match this.inner().strong.compare_exchange(n, 0, Release, Relaxed) {
             Ok(_) => {
                 std::sync::atomic::fence(Acquire);
                 let data = unsafe { std::ptr::read(&p.as_ref().data) };
                 let _weak : WeightedWeak<T> = WeightedWeak {
-                    ptr : CountedNonNullPtr::new(1, p),
+                    ptr : CountedNonNull::new(1, p),
                 };
                 std::mem::forget(this);
                 Ok(data)
@@ -506,7 +639,7 @@ impl<T> WeightedArc<T> {
         let (n, _) = this.ptr.get();
         if n > 1 {
             // Release all but one ownership
-            let m = this.ptr.strong.fetch_sub(n - 1, Relaxed);
+            let m = this.inner().strong.fetch_sub(n - 1, Relaxed);
             debug_assert!(m > 0);
         }
         let ptr : *const T = &*this;
@@ -533,7 +666,7 @@ impl<T> WeightedArc<T> {
         let offset = &(*fake_ptr).data as *const T as usize;
         let p = NonNull::new_unchecked(((ptr as usize) - offset) as *mut ArcInner<T>);
         Self {
-            ptr : CountedNonNullPtr::new(1, p),
+            ptr : CountedNonNull::new(1, p),
         }
     }
 
@@ -554,16 +687,16 @@ impl<T> WeightedArc<T> {
     /// ```
     pub fn downgrade(this: &Self) -> WeightedWeak<T> {
         let (_, p) = this.ptr.get();
-        let mut cur = this.ptr.weak.load(Relaxed);
+        let mut cur = this.inner().weak.load(Relaxed);
         loop {
             if cur == std::usize::MAX {
                 // The weak count is locked by is_unique.  Spin.
-                cur = this.ptr.weak.load(Relaxed);
+                cur = this.inner().weak.load(Relaxed);
                 continue
             }
-            match this.ptr.weak.compare_exchange_weak(cur, cur + N, Acquire, Relaxed) {
+            match this.inner().weak.compare_exchange_weak(cur, cur + N, Acquire, Relaxed) {
                 Ok(_) => break WeightedWeak {
-                    ptr: CountedNonNullPtr::new(N, p),
+                    ptr: CountedNonNull::new(N, p),
                 },
                 Err(old) => cur = old,
             }
@@ -596,7 +729,7 @@ impl<T> WeightedArc<T> {
     /// assert!(m > n);
     /// ```
     pub fn strong_count(this: &Self) -> usize {
-        this.ptr.strong.load(Relaxed)
+        this.inner().strong.load(Relaxed)
     }
 
     /// Return the total weak ownership of all `WeightedWeak`s for the managed object
@@ -625,7 +758,7 @@ impl<T> WeightedArc<T> {
     /// assert!(m > 0);
     /// ```
     pub fn weak_count(this: &Self) -> usize {
-        let n = this.ptr.weak.load(Relaxed);
+        let n = this.inner().weak.load(Relaxed);
         if n == std::usize::MAX {
             0
         } else {
@@ -656,14 +789,14 @@ impl<T> WeightedArc<T> {
     pub fn weak_bound(this: &Self) -> usize {
         // I don't understand why this load is SeqCst in std::sync::Arc.  I believe that SeqCst
         // synchronizes only with itself, not Acqure/Release?
-        let cnt = this.ptr.weak.load(Relaxed);
-        if cnt == std::usize::MAX {
+        let n = this.inner().weak.load(Relaxed);
+        if n == std::usize::MAX {
             // .weak is locked, so must have been 1
             0
         } else {
             // We are calling this on a WeightedArc, so at least one WeightedArc is extant, so
             // the offset of 1 is active on .weak
-            cnt - 1
+            n - 1
         }
     }
 
@@ -691,7 +824,7 @@ impl<T> WeightedArc<T> {
         let (n, _) = this.ptr.get();
         // I don't understand why this load is SeqCst in std::sync::Arc.  I beleive that SeqCst
         // synchronizes only with itself not Acquire/Release
-        let m = this.ptr.strong.load(Relaxed);
+        let m = this.inner().strong.load(Relaxed);
         m - n + 1
     }
 
@@ -699,7 +832,7 @@ impl<T> WeightedArc<T> {
         // We have just set .strong to zero
         let (_, mut p) = self.ptr.get();
         std::ptr::drop_in_place(&mut p.as_mut().data);
-        if self.ptr.weak.fetch_sub(1, Release) == 1 {
+        if self.inner().weak.fetch_sub(1, Release) == 1 {
             // Upgrade memory order to synchronze with dropped WeightedWeaks on other threads
             std::sync::atomic::fence(Acquire);
             std::alloc::Global.dealloc(
@@ -716,10 +849,10 @@ impl<T> WeightedArc<T> {
     }
 
     fn is_unique(&mut self) -> bool {
-        if self.ptr.weak.compare_exchange(1, std::usize::MAX, Acquire, Relaxed).is_ok() {
+        if self.inner().weak.compare_exchange(1, std::usize::MAX, Acquire, Relaxed).is_ok() {
             let (n, _) = self.ptr.get();
-            let u = self.ptr.strong.load(Relaxed) == n;
-            self.ptr.weak.store(1, Release);
+            let u = self.inner().strong.load(Relaxed) == n;
+            self.inner().weak.store(1, Release);
             u
         } else {
             false
@@ -729,7 +862,7 @@ impl<T> WeightedArc<T> {
     /// Get `&mut T` if `self` is the only `WeightedArc` managing the `T`
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
         if this.is_unique() {
-            Some(&mut this.ptr.data)
+            unsafe { Some(&mut this.ptr.as_mut().data) }
         } else {
             None
         }
@@ -756,7 +889,7 @@ impl<T> WeightedArc<T> {
     /// ```
     pub unsafe fn get_mut_unchecked(this: &mut Self) -> &mut T {
         debug_assert!(this.is_unique());
-        &mut this.ptr.data
+        &mut this.ptr.as_mut().data
     }
 
     /// Clone a `&mut WeightedArc` without touching the reference count, by taking some of
@@ -782,7 +915,7 @@ impl<T> WeightedArc<T> {
         let (n, p) = self.ptr.get();
         if n == 1 {
             // We have no spare weight, we have to hit the global count so max it
-            self.ptr.strong.fetch_add(N * 2 - 1, Relaxed);
+            self.inner().strong.fetch_add(N * 2 - 1, Relaxed);
             self.ptr.set_count(N);
             WeightedArc {
                 ptr: self.ptr,
@@ -794,7 +927,7 @@ impl<T> WeightedArc<T> {
             let b = m;
             self.ptr.set_count(a);
             WeightedArc {
-                ptr: CountedNonNullPtr::new(b, p),
+                ptr: CountedNonNull::new(b, p),
             }
         }
     }
@@ -820,10 +953,10 @@ impl<T> WeightedArc<T> {
         let m = n >> 1;
         (
             WeightedArc{
-                ptr: CountedNonNullPtr::new(n - m, p),
+                ptr: CountedNonNull::new(n - m, p),
             },
             WeightedArc{
-                ptr: CountedNonNullPtr::new(n, p),
+                ptr: CountedNonNull::new(n, p),
             }
         )
     }
@@ -855,14 +988,14 @@ impl<T> WeightedArc<T> {
             s = N;
         }
         WeightedArc {
-            ptr: CountedNonNullPtr::new(s, p)
+            ptr: CountedNonNull::new(s, p)
         }
     }
 
     fn fortify(&mut self) {
         let (n, _) = self.ptr.get();
         if n < N {
-            self.ptr.strong.fetch_add(N - n, Relaxed);
+            self.inner().strong.fetch_add(N - n, Relaxed);
             self.ptr.set_count(N);
         }
     }
@@ -870,7 +1003,7 @@ impl<T> WeightedArc<T> {
     fn condition(&mut self) {
         let (n, _) = self.ptr.get();
         if n == 1 {
-            self.ptr.strong.fetch_add(N - 1, Relaxed);
+            self.inner().strong.fetch_add(N - 1, Relaxed);
             self.ptr.set_count(N);
         }
     }
@@ -900,7 +1033,7 @@ impl<T : Clone> WeightedArc<T> {
     pub fn make_mut(this: &mut Self) -> &mut T {
         // This function is very subtle!
         let (n, p) = this.ptr.get();
-        if this.ptr.strong.compare_exchange(n, 0, Acquire, Relaxed).is_err() {
+        if this.inner().strong.compare_exchange(n, 0, Acquire, Relaxed).is_err() {
             // Another strong pointer exists, so clone .data into a new ArcInner
             *this = WeightedArc::new((**this).clone());
         } else {
@@ -911,11 +1044,11 @@ impl<T : Clone> WeightedArc<T> {
             // Weak cannot be locked since it is only locked when in a method on this object
             // which we have exclusive access to and have just shown is alone
 
-            if this.ptr.weak.load(Relaxed) != 1 {
+            if this.inner().weak.load(Relaxed) != 1 {
                 // There are weak pointers to the control block.
                 // We need to move the value and release 1 from weak.
                 let _weak : WeightedWeak<T> = WeightedWeak {
-                    ptr : CountedNonNullPtr::new(1, p),
+                    ptr : CountedNonNull::new(1, p),
                 };
 
                 unsafe {
@@ -932,13 +1065,13 @@ impl<T : Clone> WeightedArc<T> {
                 // and are a unique reference to this arc, so downgrade is not being called on us
                 // and after that, the weak count was zero
                 // thus we are the only reference
-                this.ptr.strong.store(N, Release);
+                this.inner().strong.store(N, Release);
                 this.ptr.set_count(N);
             }
 
         }
         // Return whatever we point to now
-        &mut this.ptr.data
+        unsafe { &mut this.ptr.as_mut().data }
     }
 
 
@@ -963,17 +1096,17 @@ impl<T> Clone for WeightedArc<T> {
     /// ```
     ///
     fn clone(&self) -> Self {
-        self.ptr.strong.fetch_add(N, Relaxed);
+        self.inner().strong.fetch_add(N, Relaxed);
         let (_, p) = self.ptr.get();
         Self {
-            ptr: CountedNonNullPtr::new(N, p),
+            ptr: CountedNonNull::new(N, p),
         }
     }
 }
 
 impl<T: Default> Default for WeightedArc<T> {
 
-    /// See [`std::sync::Arc::default`]
+    /// See [`std::sync::Arc`] `default`
     ///
     /// # Examples
     ///
@@ -992,14 +1125,14 @@ impl<T: Default> Default for WeightedArc<T> {
 impl<T> Deref for WeightedArc<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        &self.ptr.data
+        &self.inner().data
     }
 }
 
 impl<T> Drop for WeightedArc<T> {
     fn drop(&mut self) {
         let (n, _) = self.ptr.get();
-        if self.ptr.strong.fetch_sub(n, Release) != n {
+        if self.inner().strong.fetch_sub(n, Release) != n {
             return
         }
         std::sync::atomic::fence(Acquire);
@@ -1029,6 +1162,10 @@ unsafe impl<T: Send + Sync> Sync for WeightedArc<T> {}
 
 impl<T> WeightedWeak<T> {
 
+    fn inner(&self) -> &ArcInner<T> {
+        unsafe { self.ptr.as_ref() }
+    }
+
     /// Create an alreay expired `WeightedWeak`
     ///
     /// See [`std::sync::Weak::new`]
@@ -1047,7 +1184,7 @@ impl<T> WeightedWeak<T> {
         // A standalone WeightedWeak is created in a half-destroyed state, can never be upgraded
         // and isn't very useful!
         Self {
-            ptr : CountedNonNullPtr::new(
+            ptr : CountedNonNull::new(
                 N,
                 unsafe {
                     Box::into_raw_non_null(
@@ -1079,17 +1216,17 @@ impl<T> WeightedWeak<T> {
     /// ```
     ///
     pub fn upgrade(&self) -> Option<WeightedArc<T>> {
-        let mut s = self.ptr.strong.load(Relaxed);
+        let mut s = self.inner().strong.load(Relaxed);
         loop {
             if s == 0 {
                 break None
             }
-            match self.ptr.strong.compare_exchange_weak(s, s + N, Relaxed, Relaxed) {
+            match self.inner().strong.compare_exchange_weak(s, s + N, Relaxed, Relaxed) {
                 Ok(_) => {
                     let (_, p) = self.ptr.get();
                     break Some(
                         WeightedArc {
-                            ptr: CountedNonNullPtr::new(N, p),
+                            ptr: CountedNonNull::new(N, p),
                         }
                     )
                 },
@@ -1117,19 +1254,19 @@ impl<T> WeightedWeak<T> {
     pub fn clone_mut(&mut self) -> Self {
         let (n, p) = self.ptr.get();
         if n == 1 {
-            self.ptr.weak.fetch_add(N + N - n, Relaxed);
+            self.inner().weak.fetch_add(N + N - n, Relaxed);
             self.ptr.set_count(N);
-            WeightedWeak { ptr: CountedNonNullPtr::new(N, p) }
+            WeightedWeak { ptr: CountedNonNull::new(N, p) }
         } else {
             let m = n >> 1;
             self.ptr.set_count(n - m);
-            WeightedWeak { ptr: CountedNonNullPtr::new(m, p) }
+            WeightedWeak { ptr: CountedNonNull::new(m, p) }
         }
     }
 
     fn fortify(&mut self) {
         if self.ptr.get_count() == 1 {
-            self.ptr.weak.fetch_add(N - 1, Relaxed);
+            self.inner().weak.fetch_add(N - 1, Relaxed);
             self.ptr.set_count(N);
         }
     }
@@ -1154,10 +1291,10 @@ impl<T> Clone for WeightedWeak<T> {
     fn clone(&self) -> Self {
         // The weak count cannot be locked because it is only locked if there are no WeightedWeak
         // objects
-        self.ptr.weak.fetch_add(N, Relaxed);
+        self.inner().weak.fetch_add(N, Relaxed);
         let (_, p) = self.ptr.get();
         Self {
-            ptr: CountedNonNullPtr::new(N, p),
+            ptr: CountedNonNull::new(N, p),
         }
     }
 }
@@ -1212,7 +1349,7 @@ impl<T> AtomicOptionWeightedArc<T> {
             0 => None,
             x => Some(
                 WeightedArc {
-                    ptr: CountedNonNullPtr {
+                    ptr: CountedNonNull {
                         ptr: unsafe { NonZeroUsize::new_unchecked(x) },
                         phantom: PhantomData,
                     }
@@ -1274,7 +1411,7 @@ impl<T> AtomicOptionWeightedArc<T> {
     /// ```
     ///
     pub fn into_inner(mut self) -> Option<WeightedArc<T>> {
-        let a = Self::from_ptr(*self.ptr.get_mut());
+        let a = unsafe { std::ptr::read(self.get_mut() as *mut Option<WeightedArc<T>>) };
         std::mem::forget(self);
         a
     }
@@ -1335,14 +1472,14 @@ impl<T> AtomicOptionWeightedArc<T> {
             // We have weight 1 in our load, and weight 1 in the atomic, locking it against
             // any further loads.  We need to get more weight for the atomic, so we also get
             // more for the return value
-            expected.strong.fetch_add((N - 1) + (N - 1), Relaxed);
+            unsafe { expected.as_ref().strong.fetch_add((N - 1) + (N - 1), Relaxed) };
             desired.set_count(N);
             match self.ptr.compare_exchange(expected, desired, Release, Relaxed) {
                 Ok(_) => {},
                 Err(_) => {
                     // We failed because the expected value was not there, so we aren't blocked
                     // anyway.  Give back the excess weight.
-                    expected.strong.fetch_sub(N - 1, Relaxed);
+                    unsafe { expected.as_ref().strong.fetch_sub(N - 1, Relaxed) };
                     // The loaded value is presumably stale now, but we don't care (we wouldn't
                     // know if we hadn't looked!)
                 }
@@ -1925,7 +2062,7 @@ impl<T> AtomicOptionWeightedWeak<T> {
                     Ok(_) => {
                         if expected.get_count() == 2 {
                             // We loaded but depleted the counter
-                            expected.weak.fetch_add((N - 1) + (N - 1), Relaxed);
+                            unsafe { expected.as_ref().weak.fetch_add((N - 1) + (N - 1), Relaxed) };
                             match self.ptr.compare_exchange(
                                 expected - 1,
                                 expected + (N - 2),
@@ -1934,7 +2071,7 @@ impl<T> AtomicOptionWeightedWeak<T> {
                             ) {
                                 Ok(_) => {},
                                 Err(_) => {
-                                    expected.weak.fetch_sub(N - 1, Relaxed);
+                                    unsafe { expected.as_ref().weak.fetch_sub(N - 1, Relaxed) };
                                 }
 
                             }
