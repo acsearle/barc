@@ -1,9 +1,54 @@
-//! # Lock-free atomic `Arc` for 64-bit architectures
+//! # A lock-free atomic `Arc` for 64-bit architectures
 //!
-//! This crate provides a lock-free atomic smart pointer, a useful building block for lock-free
-//! concurrent data structures.  `WeightedArc` is a drop-in replacement for [`std::sync::Arc`], and
-//! `AtomicWeightedArc` provides the interface of the [`std::sync::atomic`] types for it.
-//! For example, we provide a lock-free [`AtomicWeightedArc::compare_exchange`].
+//! This crate provides `WeightedArc`, a drop-in replacement for `std::sync::Arc`,
+//! and `AtomicWeightedArc`, which can be concurrently accessed and mutated by multiple
+//! threads.  The implementation of `AtomicWeightedArc` is lock-free, which can be beneficial in
+//! some uses compared to the similar functionality provided by the locking
+//! `std::sync::Mutex<std::sync::Arc>`.  `AtomicWeightedArc` is a useful building block for
+//! lock-free concurrent data structures.
+//!
+//! # Example
+//!
+//! ```
+//! use barc::*;
+//! let a = AtomicWeightedArc::new(WeightedArc::new(1));
+//! let current = a.load();
+//! let new = WeightedArc::new(*current + 1);
+//! a.compare_exchange(current, new);
+//! !assert_eq(*a.load(), 2);
+//! ```
+//!
+//! # How it works
+//!
+//! On common 64-bit architectures the full address space is not used, leaving some free bits in
+//! the pointer.  We pack into these bits a 16 bit integer recording how much of the total reference
+//! count is ours.  To atomically load a WeightedArc, we perform an atomic decrement, taking
+//! one unit of ownership and getting the old count and current pointer, which is enough to
+//! construct a new valid `WeightedArc`.  If we perform tens of thousands of loads without
+//! storing a new value, the counter will be almost depleted.  Threads will then get more weight
+//! from the reference count and race to add it to the counter.  Only if all these threads are
+//! pre-empted and the available weight drops to zero will new loads have to spin until one of
+//! them manages to repair the counter.  Thus we claim the algorithm is practically lock-free.
+
+//! After 65535 consecutive loads, the counter is depleted
+//! and new loads will spin until the last successful loader gets more weight from the shared
+//! reference count and refreshes in counter.  Because of this rare case the algorithm is only
+//! almost lock-free.
+//!
+//! ## Why we can't use `std::sync::Arc`
+//!
+//! To provide lock-free atomics with this technique we need to add and subtract arbitrary values
+//! from the reference count of `std::sync::Arc` and there is no safe way to
+//! perform these operations.  One unsafe option would be to subvert lifetimes to manipulate the
+//! counts, as by calling clone and forget n times.  Another unsafe option would be to attempt to
+//! deduce the address of the reference counts and access them directly.
+//!
+//! We instead choose the safer option of creating our own version of `Arc`.  However, `Arc` is
+//! notoriously difficult to get right, so our new implementation is likely to be less correct.
+//! Our implementation provides some minor optimizations like the ability to clone from &mut self
+//! without touching the atomic reference count.  It also has some deficiencies ranging from the
+//! signifcant limitation of only supporting `Sized` types, to the trivial limitation of not
+//! supporting the impossible-to-use-correctly strong_count.
 //!
 //! `WeightedArc` is implemented with what is variously called external, distributed or weighted
 //! reference counting.
@@ -13,7 +58,7 @@
 //! We can clone a `WeightedArc` by transferring some of its weight to the clone,
 //! without touching the reference count.
 //! This allows us to perform an atomic load by subtracting a constant from a pointer-sized atomic
-//! value.
+//! value.  `AtomicWeightedArc`
 //!
 //! Rarely (after 64k consecutive loads or failed compare_exchanges) the counter is depleted,
 //! and we must spin until the thread that depleted it requests more ownership from the global
@@ -113,7 +158,7 @@ const N : usize = 1 << 16;
 /// and bitwise identical to the corresponding `std::sync::Arc`.
 // #[derive(Copy, Clone)] doesn't work
 #[derive(Debug, Eq, PartialEq)]
-pub struct CountedPtr<T> {
+struct CountedPtr<T> {
     ptr: usize,
     phantom: PhantomData<*mut T>,
 }
@@ -133,7 +178,7 @@ impl<T> CountedPtr<T> {
     /// assert_eq!(c, &mut a as *mut usize);
     /// ```
     ///
-    pub fn new(count: usize, pointer: *mut T) -> Self {
+    fn new(count: usize, pointer: *mut T) -> Self {
         debug_assert!(0 < count);
         debug_assert!(count <= N);
         debug_assert!(pointer as usize & !MASK == 0);
@@ -143,11 +188,11 @@ impl<T> CountedPtr<T> {
         }
     }
 
-    pub fn get(&self) -> (usize, *mut T) {
+    fn get(&self) -> (usize, *mut T) {
         (self.get_count(), self.get_ptr())
     }
 
-    pub fn get_count(&self) -> usize {
+    fn get_count(&self) -> usize {
         (self.ptr >> SHIFT) + 1
     }
 
@@ -155,35 +200,35 @@ impl<T> CountedPtr<T> {
         (self.ptr & MASK) as *mut T
     }
 
-    pub fn set(&mut self, count: usize, pointer: *mut T) {
+    fn set(&mut self, count: usize, pointer: *mut T) {
         *self = Self::new(count, pointer);
     }
 
-    pub fn set_count(&mut self, count: usize) {
+    fn set_count(&mut self, count: usize) {
         let (_, p) = self.get();
         *self = Self::new(count, p);
     }
 
-    pub fn set_ptr(&mut self, pointer: *mut T) {
+    fn set_ptr(&mut self, pointer: *mut T) {
         let (n, _) = self.get();
         *self = Self::new(n, pointer);
     }
 
-    pub fn ptr_eq(left: Self, right: Self) -> bool {
+    fn ptr_eq(left: Self, right: Self) -> bool {
         let (_n, p) = left.get();
         let (_m, q) = right.get();
         p == q
     }
 
-    pub fn is_null(&self) -> bool {
+    fn is_null(&self) -> bool {
         (self.ptr & MASK) != 0
     }
 
-    pub unsafe fn as_ref(&self) -> &T {
+    unsafe fn as_ref(&self) -> &T {
         &*self.get_ptr()
     }
 
-    pub unsafe fn as_mut(&mut self) -> &mut T {
+    unsafe fn as_mut(&mut self) -> &mut T {
         &mut *self.get_ptr()
     }
 
@@ -210,6 +255,16 @@ impl<T> Sub<usize> for CountedPtr<T> {
         let (n, p) = self.get();
         debug_assert!(n > rhs);
         Self::new(n - rhs, p)
+    }
+}
+
+impl<T> Sub<CountedPtr<T>> for CountedPtr<T> {
+    type Output = usize;
+    fn sub(self, rhs: CountedPtr<T>) -> usize {
+        let (n, p) = self.get();
+        let (m, q) = rhs.get();
+        debug_assert!(p == q);
+        n - m
     }
 }
 
@@ -314,7 +369,7 @@ unsafe impl<T> Sync for CountedNonNull<T> {}
 /// AtomicCountedPtr
 ///
 ///
-pub struct AtomicCountedPtr<T> {
+struct AtomicCountedPtr<T> {
     ptr: AtomicUsize,
     phantom: PhantomData<CountedPtr<T>>
 }
@@ -346,7 +401,7 @@ impl<T> AtomicCountedPtr<T> {
     /// assert_eq!(b, c.load(Relaxed));
     /// ```
     ///
-    pub fn new(p: CountedPtr<T>) -> Self {
+    fn new(p: CountedPtr<T>) -> Self {
         Self {
             ptr: AtomicUsize::new(Self::to_usize(p)),
             phantom: PhantomData,
@@ -366,7 +421,7 @@ impl<T> AtomicCountedPtr<T> {
     /// assert_eq!(b, c.into_inner());
     /// ```
     ///
-    pub fn into_inner(self) -> CountedPtr<T> {
+    fn into_inner(self) -> CountedPtr<T> {
         Self::from_usize(self.ptr.into_inner())
     }
 
@@ -388,7 +443,7 @@ impl<T> AtomicCountedPtr<T> {
     /// assert_eq!(e, c.load(Relaxed));
     /// ```
     ///
-    pub fn get_mut(&mut self) -> &mut CountedPtr<T> {
+    fn get_mut(&mut self) -> &mut CountedPtr<T> {
         // Relies on layout
         unsafe { &mut *(self.ptr.get_mut() as *mut usize as *mut CountedPtr<T>) }
     }
@@ -407,7 +462,7 @@ impl<T> AtomicCountedPtr<T> {
     /// assert_eq!(b, c.load(Relaxed));
     /// ```
     ///
-    pub fn load(&self, order: Ordering) -> CountedPtr<T> {
+    fn load(&self, order: Ordering) -> CountedPtr<T> {
         Self::from_usize(self.ptr.load(order))
     }
 
@@ -428,7 +483,7 @@ impl<T> AtomicCountedPtr<T> {
     /// assert_eq!(e, c.load(Relaxed));
     /// ```
     ///
-    pub fn store(&self, p: CountedPtr<T>, order: Ordering) {
+    fn store(&self, p: CountedPtr<T>, order: Ordering) {
         self.ptr.store(Self::to_usize(p), order)
     }
 
@@ -449,11 +504,11 @@ impl<T> AtomicCountedPtr<T> {
     /// assert_eq!(e, c.load(Relaxed));
     /// ```
     ///
-    pub fn swap(&self, p: CountedPtr<T>, order: Ordering) -> CountedPtr<T> {
+    fn swap(&self, p: CountedPtr<T>, order: Ordering) -> CountedPtr<T> {
         Self::from_usize(self.ptr.swap(Self::to_usize(p), order))
     }
 
-    pub fn compare_and_swap(
+    fn compare_and_swap(
         &self,
         current: CountedPtr<T>,
         new: CountedPtr<T>,
@@ -468,7 +523,7 @@ impl<T> AtomicCountedPtr<T> {
         )
     }
 
-    pub fn compare_exchange(
+    fn compare_exchange(
         &self,
         current: CountedPtr<T>,
         new: CountedPtr<T>,
@@ -486,7 +541,7 @@ impl<T> AtomicCountedPtr<T> {
         }
     }
 
-    pub fn compare_exchange_weak(
+    fn compare_exchange_weak(
         &self,
         current: CountedPtr<T>,
         new: CountedPtr<T>,
@@ -511,7 +566,7 @@ unsafe impl<T> Sync for AtomicCountedPtr<T> {}
 
 
 
-///
+/// Control block compatible with private struct std::sync::ArcInner
 ///
 ///
 struct ArcInner<T : ?Sized> {
@@ -925,6 +980,9 @@ impl<T> WeightedArc<T> {
             let m = n >> 1;
             let a = n - m;
             let b = m;
+            !debug_assert(a > 0);
+            !debug_assert(b > 0);
+            !debug_assert((a + b) == n)
             self.ptr.set_count(a);
             WeightedArc {
                 ptr: CountedNonNull::new(b, p),
@@ -1264,6 +1322,16 @@ impl<T> WeightedWeak<T> {
         }
     }
 
+    pub fn split(mut this: Self) -> (Self, Self) {
+        let a = this.clone_mut();
+        (this, a)
+    }
+
+    pub fn merge(a: Self, b: Self) -> Self {
+        // todo: fixme!
+        a
+    }
+
     fn fortify(&mut self) {
         if self.ptr.get_count() == 1 {
             self.inner().weak.fetch_add(N - 1, Relaxed);
@@ -1451,6 +1519,10 @@ impl<T> AtomicOptionWeightedArc<T> {
             }
             if n == 1 {
                 // Spin until the count is increased
+
+                // This should be practically impossible: requires 256 threads to be inside .load
+                // or .compare_exchange.  We want to know if it happens!
+                debug_assert!(false);
                 std::thread::yield_now();
                 expected = self.ptr.load(Relaxed);
                 continue
@@ -1467,6 +1539,9 @@ impl<T> AtomicOptionWeightedArc<T> {
             }
         }
         expected = desired;
+
+        self.maybe_replenish(&mut expected);
+
         let (n, _) = expected.get();
         if n == 1 {
             // We have weight 1 in our load, and weight 1 in the atomic, locking it against
@@ -1490,6 +1565,49 @@ impl<T> AtomicOptionWeightedArc<T> {
             expected.set_count(1);
         }
         Self::from_ptr(expected)
+    }
+
+    /// Takes the raw result of a load, checks its weight, maybe gets new weight from the
+    /// global reference count and replenishes counter
+    ///
+    ///
+    fn maybe_replenish(&self, expected: &mut CountedPtr<ArcInner<T>>) {
+        let (n, p) = expected.get();
+        debug_assert!(!p.is_null());
+        if n <= 256 { // rare path
+            // Try to replenish the counter before we run out and block other threads
+            let mut current = *expected;
+
+            // Total weight available to us is n + 1
+            // Total weight that can be stored in the atomic and the result is N + N
+            // Get extra weight to maximize both
+            unsafe { (*p).strong.fetch_add((N - 1) + (N - n), Relaxed) };
+            expected.set_count(N);
+            let k = N - n;
+
+            loop {
+                let mut new = current + k;
+                match self.ptr.compare_exchange_weak(current, new, Release, Relaxed) {
+                    Ok(_) => {
+                        break
+                    },
+                    Err(actual) => {
+                        let (m, q) = actual.get();
+                        if (q != p) || (m > n) {
+                            // We can't install; either the count increased (so problem solved)
+                            // or the pointer changed (so problem solved).  Give back some of the
+                            // count
+                            unsafe { (*p).strong.fetch_sub(k, Relaxed) };
+                            break
+                        }
+                        current = actual;
+                    },
+                }
+            }
+        } else {
+            // The counter is fine
+            expected.set_count(1);
+        }
     }
 
     /// Atomically store a value.  The previous value is dropped.
@@ -1622,7 +1740,7 @@ impl<T> AtomicOptionWeightedArc<T> {
                     expected_cp = self.ptr.load(Relaxed);
                     continue;
                 }
-                let desired_cp = CountedPtr::new(n - 1, p);
+                let mut desired_cp = expected_cp - 1;
                 match self.ptr.compare_exchange_weak(
                     expected_cp,
                     desired_cp,
@@ -1630,39 +1748,10 @@ impl<T> AtomicOptionWeightedArc<T> {
                     Relaxed,
                 ) {
                     Ok(_) => {
-                        // Failure linearization point
-                        let mut m = 1;
-                        if n == 2 {
-                            // Rare branch
-                            // No more loads are possible until we put more weight into the atomic
-                            // Since we are touching the refcount anyway, also get more weight
-                            // for the return value
-                            unsafe { (*p).strong.fetch_add((N - 1) + (N - 1), Relaxed); }
-                            m = N;
-                            // Deliberately not compare_exchange_weak: real failure is fine, but
-                            // we can't accept spurious failure
-                            match self.ptr.compare_exchange(
-                                desired_cp,
-                                CountedPtr::new(N, p), // Maximum weight
-                                AcqRel, // Ordered with the refcount manipulations above and below
-                                Relaxed,
-                            ) {
-                                Ok(_) => {
-                                    // We replenished the count
-                                },
-                                Err(_) => {
-                                    // True failure, so some other thread has really changed the
-                                    // value.  Give back some of the extra weight, using the rest
-                                    // to top up the return value
-                                    unsafe { (*p).strong.fetch_sub(N - 1, Relaxed) };
-                                    // The loaded value is presumably stale now, but we don't care
-                                    // (we wouldn't know if we hadn't looked!)
-                                }
-                            }
-                        }
+                        self.maybe_replenish(&mut desired_cp);
                         Self::from_ptr(current_cp);
                         Self::from_ptr(new_cp);
-                        return Err(Self::from_ptr(CountedPtr::new(m, p)))
+                        return Err(Self::from_ptr(desired_cp));
                     },
                     Err(old) => {
                         expected_cp = old;
