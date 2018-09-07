@@ -15,7 +15,7 @@
 //! let current = a.load();
 //! let new = WeightedArc::new(*current + 1);
 //! a.compare_exchange(current, new);
-//! !assert_eq(*a.load(), 2);
+//! assert_eq!(*a.load(), 2);
 //! ```
 //!
 //! # How it works
@@ -146,6 +146,8 @@ const SHIFT : usize = 48;
 const MASK  : usize = (1 << SHIFT) - 1;
 const N : usize = 1 << 16;
 
+const APPROX_MAX_LOCKFREE_THREADS : usize = 1 << 8;
+
 /// Pointer and small counter packed into a 64 bit value
 ///
 /// This trivial non-owning struct solves the problems of packing and unpacking the count and
@@ -165,19 +167,6 @@ struct CountedPtr<T> {
 
 impl<T> CountedPtr<T> {
 
-    ///
-    /// # Examples:
-    ///
-    /// ```
-    /// use barc::*;
-    ///
-    /// let mut a = 1usize;
-    /// let b = CountedPtr::new(2, &mut a as *mut usize);
-    /// let (n, c) = b.get();
-    /// assert_eq!(n, 2);
-    /// assert_eq!(c, &mut a as *mut usize);
-    /// ```
-    ///
     fn new(count: usize, pointer: *mut T) -> Self {
         debug_assert!(0 < count);
         debug_assert!(count <= N);
@@ -255,16 +244,6 @@ impl<T> Sub<usize> for CountedPtr<T> {
         let (n, p) = self.get();
         debug_assert!(n > rhs);
         Self::new(n - rhs, p)
-    }
-}
-
-impl<T> Sub<CountedPtr<T>> for CountedPtr<T> {
-    type Output = usize;
-    fn sub(self, rhs: CountedPtr<T>) -> usize {
-        let (n, p) = self.get();
-        let (m, q) = rhs.get();
-        debug_assert!(p == q);
-        n - m
     }
 }
 
@@ -387,20 +366,6 @@ impl<T> AtomicCountedPtr<T> {
         }
     }
 
-    /// Creates a new [`AtomicCountedPtr`]
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use barc::*;
-    /// use std::sync::atomic::Ordering::Relaxed;
-    ///
-    /// let mut a = 1usize;
-    /// let b = CountedPtr::new(2, &mut a);
-    /// let c = AtomicCountedPtr::new(b.clone());
-    /// assert_eq!(b, c.load(Relaxed));
-    /// ```
-    ///
     fn new(p: CountedPtr<T>) -> Self {
         Self {
             ptr: AtomicUsize::new(Self::to_usize(p)),
@@ -408,102 +373,23 @@ impl<T> AtomicCountedPtr<T> {
         }
     }
 
-    /// Consumes an [`AtomicCountedPtr`] returning a [`CountedPtr`]
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use barc::*;
-    ///
-    /// let mut a = 1usize;
-    /// let b = CountedPtr::new(2, &mut a);
-    /// let c = AtomicCountedPtr::new(b);
-    /// assert_eq!(b, c.into_inner());
-    /// ```
-    ///
     fn into_inner(self) -> CountedPtr<T> {
         Self::from_usize(self.ptr.into_inner())
     }
 
-    /// Get a mutable reference into an unshared [`AtomicCountedPtr`].  This is not atomic since
-    /// the instance is not shared.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use barc::*;
-    /// use std::sync::atomic::Ordering::Relaxed;
-    ///
-    /// let mut a = 1usize;
-    /// let b = CountedPtr::new(2, &mut a);
-    /// let mut c = AtomicCountedPtr::new(b);
-    /// let mut d = 2usize;
-    /// let e = CountedPtr::new(3, &mut d);
-    /// *c.get_mut() = e;
-    /// assert_eq!(e, c.load(Relaxed));
-    /// ```
-    ///
     fn get_mut(&mut self) -> &mut CountedPtr<T> {
         // Relies on layout
         unsafe { &mut *(self.ptr.get_mut() as *mut usize as *mut CountedPtr<T>) }
     }
 
-    /// Atomically load a `CountedPtr`
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use barc::*;
-    /// use std::sync::atomic::Ordering::Relaxed;
-    ///
-    /// let mut a = 1usize;
-    /// let b = CountedPtr::new(2, &mut a);
-    /// let c = AtomicCountedPtr::new(b);
-    /// assert_eq!(b, c.load(Relaxed));
-    /// ```
-    ///
     fn load(&self, order: Ordering) -> CountedPtr<T> {
         Self::from_usize(self.ptr.load(order))
     }
 
-    /// Atomically store a `CountedPtr`
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use barc::*;
-    /// use std::sync::atomic::Ordering::Relaxed;
-    ///
-    /// let mut a = 1usize;
-    /// let b = CountedPtr::new(2, &mut a);
-    /// let c = AtomicCountedPtr::new(b);
-    /// let mut d = 2usize;
-    /// let e = CountedPtr::new(3, &mut d);
-    /// c.store(e, Relaxed);
-    /// assert_eq!(e, c.load(Relaxed));
-    /// ```
-    ///
     fn store(&self, p: CountedPtr<T>, order: Ordering) {
         self.ptr.store(Self::to_usize(p), order)
     }
 
-    /// Atomically swap a `CountedPtr`
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use barc::*;
-    /// use std::sync::atomic::Ordering::Relaxed;
-    ///
-    /// let mut a = 1usize;
-    /// let b = CountedPtr::new(2, &mut a);
-    /// let c = AtomicCountedPtr::new(b);
-    /// let mut d = 2usize;
-    /// let e = CountedPtr::new(3, &mut d);
-    /// assert_eq!(b, c.swap(e, Relaxed));
-    /// assert_eq!(e, c.load(Relaxed));
-    /// ```
-    ///
     fn swap(&self, p: CountedPtr<T>, order: Ordering) -> CountedPtr<T> {
         Self::from_usize(self.ptr.swap(Self::to_usize(p), order))
     }
@@ -980,9 +866,9 @@ impl<T> WeightedArc<T> {
             let m = n >> 1;
             let a = n - m;
             let b = m;
-            !debug_assert(a > 0);
-            !debug_assert(b > 0);
-            !debug_assert((a + b) == n)
+            debug_assert!(a > 0);
+            debug_assert!(b > 0);
+            debug_assert!((a + b) == n);
             self.ptr.set_count(a);
             WeightedArc {
                 ptr: CountedNonNull::new(b, p),
@@ -1520,8 +1406,9 @@ impl<T> AtomicOptionWeightedArc<T> {
             if n == 1 {
                 // Spin until the count is increased
 
-                // This should be practically impossible: requires 256 threads to be inside .load
-                // or .compare_exchange.  We want to know if it happens!
+                // This should be practically impossible: requires APPROX_MAX_LOCKFREE_THREADS
+                // threads to be inside .load or failing .compare_exchange.
+                // We want to know if it happens!
                 debug_assert!(false);
                 std::thread::yield_now();
                 expected = self.ptr.load(Relaxed);
@@ -1541,29 +1428,6 @@ impl<T> AtomicOptionWeightedArc<T> {
         expected = desired;
 
         self.maybe_replenish(&mut expected);
-
-        let (n, _) = expected.get();
-        if n == 1 {
-            // We have weight 1 in our load, and weight 1 in the atomic, locking it against
-            // any further loads.  We need to get more weight for the atomic, so we also get
-            // more for the return value
-            unsafe { expected.as_ref().strong.fetch_add((N - 1) + (N - 1), Relaxed) };
-            desired.set_count(N);
-            match self.ptr.compare_exchange(expected, desired, Release, Relaxed) {
-                Ok(_) => {},
-                Err(_) => {
-                    // We failed because the expected value was not there, so we aren't blocked
-                    // anyway.  Give back the excess weight.
-                    unsafe { expected.as_ref().strong.fetch_sub(N - 1, Relaxed) };
-                    // The loaded value is presumably stale now, but we don't care (we wouldn't
-                    // know if we hadn't looked!)
-                }
-            }
-            // No matter what, we have strengthened the reesult
-            expected.set_count(N);
-        } else {
-            expected.set_count(1);
-        }
         Self::from_ptr(expected)
     }
 
@@ -1574,8 +1438,8 @@ impl<T> AtomicOptionWeightedArc<T> {
     fn maybe_replenish(&self, expected: &mut CountedPtr<ArcInner<T>>) {
         let (n, p) = expected.get();
         debug_assert!(!p.is_null());
-        if n <= 256 { // rare path
-            // Try to replenish the counter before we run out and block other threads
+        if n <= APPROX_MAX_LOCKFREE_THREADS { // rare path
+            // Try to replenish the counter before it depletes and threads start spinning
             let mut current = *expected;
 
             // Total weight available to us is n + 1
@@ -1716,7 +1580,8 @@ impl<T> AtomicOptionWeightedArc<T> {
                 ) {
                     Ok(old) => {
                         // Success linearization point
-                        // Todo: merge these two objects rather than drop one
+                        // Todo: merge these two objects rather than drop one.  Since current was
+                        // likely split off old, should be common that they can be merged.
                         Self::from_ptr(current_cp);
                         return Ok(Self::from_ptr(old))
                     },
@@ -1775,6 +1640,12 @@ impl<T> AtomicOptionWeightedArc<T> {
         self.compare_exchange(current, new)
     }
 
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for AtomicOptionWeightedArc<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.load(), f)
+    }
 }
 
 impl<T> Default for AtomicOptionWeightedArc<T> {
@@ -2352,6 +2223,9 @@ mod tests {
         {
             let cage = Cage::new();
             assert!(std::mem::size_of::<Option<WeightedArc<Canary>>>() == 8);
+            assert!(std::mem::size_of::<Option<WeightedWeak<Canary>>>() == 8);
+            assert!(APPROX_MAX_LOCKFREE_THREADS <= N);
+            assert!(1 <= APPROX_MAX_LOCKFREE_THREADS);
         }
         {
             let cage = Cage::new();
