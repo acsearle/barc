@@ -1,3 +1,6 @@
+// A simple concurrent stack to exercise AtomicWeightedArc, and grab-bag of stress-tests and
+// dubious benchmarks
+
 extern crate barc;
 use barc::*;
 
@@ -6,7 +9,6 @@ use std::clone::Clone;
 
 use std::sync::atomic::AtomicIsize;
 use std::sync::atomic::Ordering::Relaxed;
-
 
 /// Singly-linked-list Node for a simple unbounded concurrent Stack
 ///
@@ -21,7 +23,7 @@ struct Node<T : Debug> {
 
 impl<T : Debug> Node<T> {
     fn new(nxt: Option<WeightedArc<Node<T>>>, val: T) -> Node<T> {
-        println!("Newing {:?}", val);
+        println!("Creating node ({:?})", val);
         Node {
             next: nxt,
             value: AtomicOptionWeightedArc::new(
@@ -31,8 +33,6 @@ impl<T : Debug> Node<T> {
     }
 
     fn into_inner(self) -> T {
-        //let Self { next, value: v } = this;
-        //v
         unsafe {
             let _ = std::ptr::read(&self.next);
             let v = std::ptr::read(&self.value);
@@ -44,7 +44,7 @@ impl<T : Debug> Node<T> {
 
 impl<T : Debug> Drop for Node<T> {
     fn drop(&mut self) {
-        println!("Dropping {:?}", self.value);
+        println!("Dropping node ({:?})", self.value);
         // Automatic drop is correct, but it recurses along a linked list and
         // thus tends to blow the stack.  We have to convert the iteration
         // into recursion.  If we are the sole owner of the next node, we take
@@ -70,10 +70,10 @@ impl<T : Debug> Drop for Node<T> {
     }
 }
 
-// Simple unbounded concurrent Stack using AtomicOptionArc
+// Simple unbounded concurrent Stack using AtomicOptionWeightedArc
 //
-// Does not suffer from the ABA problem because the (atomic) Arcs guarantee
-// memory is not recycled while we hold any pointers to it
+// Does not suffer from the ABA problem because the (atomic) WeightedArcs prevent memory from
+// being recycled while we hold reference to it
 
 struct Stack<T : std::fmt::Debug> {
     head: AtomicOptionWeightedArc<Node<T>>,
@@ -99,6 +99,7 @@ impl<T : Clone + std::fmt::Debug> Stack<T> {
 
     fn pop(&self) -> Option<T> {
         let mut current = self.head.load();
+        // todo: flatten
         loop {
             let tmp;
             match current {
@@ -109,7 +110,7 @@ impl<T : Clone + std::fmt::Debug> Stack<T> {
                                 Some(x) => {
                                     match x.value.swap(None) {
                                         Some(y) => {
-                                            return Some(WeightedArc::try_unwrap(y).expect("shared"))
+                                            return Some(WeightedArc::try_unwrap(y).expect("The stored value is shared"))
                                         },
                                         None => { return None },
                                     }
@@ -134,21 +135,76 @@ impl<T : std::fmt::Debug> Default for Stack<T> {
     }
 }
 
+fn exercise_stack() {
+
+    // Exercise the stack implementation to catch basic bugs.
+    //
+    // Note that the debugging output introduces extra
+    // synchronization between the threads and tends to serialize everything.
+
+    println!("Exercising concurrent stack");
+
+    let arcstack = WeightedArc::new(Stack::default());
+
+    let mut v = Vec::default();
+
+    let bar = WeightedArc::new(std::sync::Barrier::new(8));
+
+    for k in 0..8 {
+        let s = arcstack.clone();
+        let q = bar.clone();
+        v.push(std::thread::spawn(move || {
+            q.wait();
+            for i in 0..4 {
+                let j = i * 2 + k * 8;
+                s.push(j);
+                println!("Pushed {}", j);
+                s.push(j + 1);
+                println!("Pushed {}", j + 1);
+                let p = s.pop();
+                println!("Popped {:?}", p)
+            }
+            for _i in 0..5 {
+                let p = s.pop();
+                println!("Popped {:?}", p)
+            }
+        }));
+    }
+
+    for h in v {
+        h.join().expect("Failed join");
+    }
+
+}
+
 fn main() {
 
-    // Ham-fisted benchmarks for performance under contention.  Mutex is always terrible, so we
-    // have that win.  WeightedArc's swaps and stores are about as good as raw AtomicPtr, which
-    // of course they almost always are.
-    // Loads are bad because they are basically compare-exchanges.
+    exercise_stack();
 
-    // Question: how different is fetch_add[sub] to load-compare_exchange_weak?
-    // load() vs clone()
+    return;
+
+    // Benchmark notes (8-core 2013 MBP):
+    //
+    // Use better harness!  Timing is unreliable, includes thread startup, etc.
+    //
+    // Mutex is very slow for everything (related to fairness, per parking_lot blog?)
+    //
+    // WeightedArc swap and store === AtomicPtr (as expected)
+    //
+    // Contested WeightedArc load much slower than AtomicPtr load, comparable to AtomicPtr
+    // compare_exchange (as expected).  WeightedArc load faster than RwLock<Arc> clone.
+    // WeightedArc load significantly slower than the fetch_sub that it is almost always equivalent
+    // to, because compare_exchange, because we must catch unlikely counter exhaustion.
+
+    // todo: parameterize cores, factor out bench harness, fix timing and barriers, test mixed
+    // operations
+
 
     {
         // Stress-test swaps
 
         let a = 100;
-        let b = WeightedArc::new(100);
+        let b = WeightedArc::new(a);
         let c = AtomicWeightedArc::new(b);
         let d = WeightedArc::new(c);
 
@@ -167,7 +223,7 @@ fn main() {
                 let f = &*e;
                 g.wait();
                 let mut h = WeightedArc::new(i);
-                for j in 0..n {
+                for _j in 0..n {
                     h = f.swap(h);
                 }
             }));
@@ -183,7 +239,7 @@ fn main() {
         let then = now.elapsed();
         let t = (then.as_secs() as f64) * 1e9 + (then.subsec_nanos() as f64);
 
-        println!("AtomicOpionWeightedArc ns per swap {}", t / ((n * 8) as f64));
+        println!("AtomicOptionWeightedArc ns per swap {}", t / ((n * 8) as f64));
 
     }
 
@@ -191,7 +247,7 @@ fn main() {
         // Stress-test swaps
 
         let a = 100;
-        let b = std::sync::Arc::new(100);
+        let b = std::sync::Arc::new(a);
         let c = std::sync::Mutex::new(b);
         let d = std::sync::Arc::new(c);
 
@@ -210,7 +266,7 @@ fn main() {
                 let f = &*e;
                 g.wait();
                 let mut h = std::sync::Arc::new(i);
-                for j in 0..n {
+                for _j in 0..n {
                     // h = f.lock().unwrap().swap(h);
                     let tmp;
                     {
@@ -278,8 +334,7 @@ fn main() {
         let then = now.elapsed();
         let t = (then.as_secs() as f64) * 1e9 + (then.subsec_nanos() as f64);
 
-        println!("strong_bound {}", WeightedArc::strong_bound(&d.swap(WeightedArc::new(AtomicIsize::new(0)))));
-        println!("AtomicOpionWeightedArc ns per thing {}", t / (n as f64));
+        println!("AtomicOptionWeightedArc ns per contested load {}", t / (n as f64));
 
     }
 
@@ -327,8 +382,7 @@ fn main() {
         let then = now.elapsed();
         let t = (then.as_secs() as f64) * 1e9 + (then.subsec_nanos() as f64);
 
-        //println!("strong_bound {}", WeightedArc::strong_bound(&d.swap(WeightedArc::new(AtomicIsize::new(0)))));
-        println!("Mutex ns per thing {}", t / (n as f64));
+        println!("Mutex ns per contested lock-clone {}", t / (n as f64));
 
     }
 
@@ -376,51 +430,7 @@ fn main() {
         let then = now.elapsed();
         let t = (then.as_secs() as f64) * 1e9 + (then.subsec_nanos() as f64);
 
-        //println!("strong_bound {}", WeightedArc::strong_bound(&d.swap(WeightedArc::new(AtomicIsize::new(0)))));
-        println!("RwLock ns per thing {}", t / (n as f64));
-
-    }
-
-
-
-    return;
-
-    {
-
-        // Exercise the Stack.  This doesn't prove anything but does catch some
-        // basic bugs.  Note that the debugging output introduces extra
-        // synchronization between the threads and tends to serialize everything.
-
-        let arcstack = WeightedArc::new(Stack::default());
-
-        let mut v = Vec::default();
-
-        let bar = WeightedArc::new(std::sync::Barrier::new(8));
-
-        for k in 0..8 {
-            let s = arcstack.clone();
-            let q = bar.clone();
-            v.push(std::thread::spawn(move || {
-                q.wait();
-                for i in 0..4 {
-                    let j = i * 2 + k * 8;
-                    s.push(j);
-                    println!("Pushed {}", j);
-                    s.push(j + 1);
-                    println!("Pushed {}", j + 1);
-                    let p = s.pop();
-                    println!("Popped {:?}", p)
-                }
-                for _i in 0..5 {
-                    let p = s.pop();
-                    println!("Popped {:?}", p)
-                }
-            }));
-        }
-
-        for h in v {
-            h.join().expect("oops");
-        }
+        println!("RwLock ns per contested read-clone {}", t / (n as f64));
 
     }
 
